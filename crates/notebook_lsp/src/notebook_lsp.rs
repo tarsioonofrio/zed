@@ -402,12 +402,16 @@ impl NotebookLsp {
     ) -> Self {
         let lsp_store = project.read(cx).lsp_store();
         let lsp_subscription = cx.subscribe(&lsp_store, |this, _lsp_store, event, cx| {
-            if let LspStoreEvent::DiagnosticsUpdated { server_id, paths } = event {
-                if let Some(document) = this.document.as_ref()
-                    && paths.contains(&document.path)
-                {
-                    this.forward_diagnostics(*server_id, cx);
+            match event {
+                LspStoreEvent::DiagnosticsUpdated { server_id, paths } => {
+                    if let Some(document) = this.document.as_ref()
+                        && paths.contains(&document.path)
+                    {
+                        this.forward_diagnostics(*server_id, cx);
+                    }
                 }
+                LspStoreEvent::LanguageServerAdded(..) => this.pull_document_diagnostics(cx),
+                _ => {}
             }
         });
 
@@ -770,6 +774,21 @@ impl NotebookLsp {
             "notebook_lsp: rewrote virtual document ({} bytes)",
             document.text.len()
         );
+        self.pull_document_diagnostics(cx);
+    }
+
+    /// Servers such as ruff publish diagnostics only when asked, and editors do the
+    /// asking for the buffers they show. Nothing displays the virtual document, so it
+    /// is pulled here whenever its text or the set of servers changes.
+    fn pull_document_diagnostics(&self, cx: &mut Context<Self>) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let buffer = document.buffer.clone();
+        let pull = self.project.read(cx).lsp_store().update(cx, |lsp_store, cx| {
+            lsp_store.pull_diagnostics_for_buffer(buffer, cx)
+        });
+        pull.detach_and_log_err(cx);
     }
 
     /// Applies a transaction produced against the virtual document to the cell
