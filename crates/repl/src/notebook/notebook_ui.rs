@@ -3794,9 +3794,38 @@ fn parse_notebook_content(content: &str) -> Result<nbformat::v4::Notebook> {
     Ok(parse_notebook_content_with_missing_ids(content)?.0)
 }
 
+/// An empty file is how a new notebook starts: it opens as one empty Python
+/// code cell and only becomes valid JSON on disk at the first save.
+fn new_notebook() -> Result<nbformat::v4::Notebook> {
+    let template = serde_json::json!({
+        "cells": [{
+            "cell_type": "code",
+            "id": Uuid::new_v4().to_string(),
+            "metadata": {},
+            "execution_count": null,
+            "outputs": [],
+            "source": [],
+        }],
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    });
+    match nbformat::parse_notebook(&template.to_string()) {
+        Ok(nbformat::Notebook::V4(notebook)) => Ok(notebook),
+        Ok(_) => Err(anyhow::anyhow!("new notebook is not nbformat 4")),
+        Err(error) => Err(anyhow::anyhow!("Failed to build new notebook: {error:?}")),
+    }
+}
+
 fn parse_notebook_content_with_missing_ids(
     content: &str,
 ) -> Result<(nbformat::v4::Notebook, Vec<bool>)> {
+    if content.trim().is_empty() {
+        return Ok((new_notebook()?, vec![false]));
+    }
     let mut json: serde_json::Value = serde_json::from_str(content)?;
     let mut missing_cell_ids = Vec::new();
     if let Some(cells) = json.get_mut("cells").and_then(|cells| cells.as_array_mut()) {
@@ -4303,12 +4332,7 @@ impl project::ProjectItem for NotebookItem {
                 let file_content = buffer.read_with(cx, |buffer, _| buffer.text());
 
                 let notebook = if file_content.trim().is_empty() {
-                    nbformat::v4::Notebook {
-                        nbformat: 4,
-                        nbformat_minor: 5,
-                        cells: vec![],
-                        metadata: serde_json::from_str("{}").unwrap(),
-                    }
+                    new_notebook()?
                 } else {
                     let notebook = match nbformat::parse_notebook(&file_content) {
                         Ok(nb) => nb,
@@ -5380,6 +5404,35 @@ mod tests {
     /// The language server only receives an interpreter when the kernel names an
     /// absolute binary. A venv-backed `PythonEnv` and an absolute Jupyter
     /// kernelspec do; the generic `python3` fallback does not.
+    #[test]
+    fn empty_file_starts_a_new_python_notebook_with_one_empty_cell() {
+        for content in ["", "  \n\t"] {
+            let notebook = parse_notebook_content(content).unwrap();
+            assert_eq!(notebook.cells.len(), 1);
+            assert!(matches!(
+                &notebook.cells[0],
+                nbformat::v4::Cell::Code { source, outputs, .. }
+                    if source.is_empty() && outputs.is_empty()
+            ));
+            assert_eq!(
+                notebook
+                    .metadata
+                    .language_info
+                    .as_ref()
+                    .map(|info| info.name.as_str()),
+                Some("python")
+            );
+            assert_eq!(
+                notebook
+                    .metadata
+                    .kernelspec
+                    .as_ref()
+                    .map(|spec| spec.name.as_str()),
+                Some("python3")
+            );
+        }
+    }
+
     #[test]
     fn python_interpreter_for_spec_extracts_absolute_paths_only() {
         let venv_interpreter = path!("/project/.venv/bin/python");

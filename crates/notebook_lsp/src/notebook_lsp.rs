@@ -46,7 +46,7 @@ use project::{
         OpenLspBufferHandle,
     },
 };
-use util::ResultExt;
+use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 
 /// How long to wait after a cell edit before rewriting the virtual document,
 /// so that a burst of keystrokes results in a single document change.
@@ -297,6 +297,7 @@ pub struct NotebookLsp {
     _setup_task: Option<Task<()>>,
     _toolchain_task: Option<Task<()>>,
     _lsp_subscription: Subscription,
+    owns_remote_document: bool,
 }
 
 /// Directory that holds the virtual document for the notebook at `notebook_path`.
@@ -368,7 +369,7 @@ impl NotebookLsp {
 
         let mut this = Self {
             project,
-            notebook_path: notebook_path.clone(),
+            notebook_path,
             language,
             document_directory_override: document_directory,
             document: None,
@@ -379,15 +380,21 @@ impl NotebookLsp {
             _setup_task: None,
             _toolchain_task: None,
             _lsp_subscription: lsp_subscription,
+            owns_remote_document: false,
         };
 
-        if this.project.read(cx).is_via_remote_server() {
-            log::info!(
-                "notebook LSP disabled: {} is hosted on a remote server",
-                notebook_path.display()
-            );
-            return this;
-        }
+        cx.on_release(|this, cx| {
+            let (true, Some(document)) = (this.owns_remote_document, this.document.as_ref()) else {
+                return;
+            };
+            let path = document.path.clone();
+            this.project.update(cx, |project, cx| {
+                if let Some(task) = project.delete_file(path, cx) {
+                    task.detach_and_log_err(cx);
+                }
+            });
+        })
+        .detach();
 
         this.spawn_setup(cx);
         this
@@ -431,6 +438,10 @@ impl NotebookLsp {
 
     /// Flushes the virtual document to disk, mirroring the notebook file.
     pub fn save(&self, cx: &mut App) {
+        // Saving would write the virtual document into the remote project.
+        if self.project.read(cx).is_via_remote_server() {
+            return;
+        }
         let Some(document) = self.document.as_ref() else {
             return;
         };
@@ -533,45 +544,93 @@ impl NotebookLsp {
                     .and_then(|stem| stem.to_str())
                     .unwrap_or("notebook")
                     .to_string();
-                let directory = document_directory
-                    .unwrap_or_else(|| document_directory_for(&notebook_path));
-                let absolute_path = directory.join(format!("{stem}.{extension}"));
+                let is_remote = project.read_with(cx, |project, _| project.is_via_remote_server());
+                let (worktree, relative_path) = if is_remote {
+                    // The language servers run on the remote machine, so the virtual
+                    // document is an unsaved buffer beside the notebook there: it never
+                    // exists on disk and the project's own config and modules resolve.
+                    let notebook_directory = notebook_path
+                        .parent()
+                        .context("remote notebook has no parent directory")?;
+                    let (worktree, directory_path) = project
+                        .update(cx, |project, cx| {
+                            project.find_or_create_worktree(notebook_directory, false, cx)
+                        })
+                        .await
+                        .context("find worktree of the remote notebook")?;
+                    let file_name = format!(".{stem}.notebook.{extension}");
+                    let file_name = RelPath::new(Path::new(&file_name), PathStyle::Unix)?;
+                    let relative_path: Arc<RelPath> = directory_path.join(&file_name).into();
+                    // The remote server only opens (and serves language servers for) files
+                    // that exist, so an empty placeholder is created and removed on release.
+                    let project_path = ProjectPath {
+                        worktree_id: worktree.read_with(cx, |worktree, _| worktree.id()),
+                        path: relative_path.clone(),
+                    };
+                    let exists = project.read_with(cx, |project, cx| {
+                        project.entry_for_path(&project_path, cx).is_some()
+                    });
+                    if !exists {
+                        project
+                            .update(cx, |project, cx| {
+                                project.create_entry(project_path, false, cx)
+                            })
+                            .await
+                            .context("create remote virtual document")?;
+                        this.update(cx, |this, _| this.owns_remote_document = true)?;
+                    }
+                    log::info!(
+                        "notebook_lsp: remote virtual document {} beside {}",
+                        file_name.as_unix_str(),
+                        notebook_path.display()
+                    );
+                    (worktree, relative_path)
+                } else {
+                    let directory = document_directory
+                        .unwrap_or_else(|| document_directory_for(&notebook_path));
+                    let absolute_path = directory.join(format!("{stem}.{extension}"));
 
-                let fs = project.read_with(cx, |project, _| project.fs().clone());
-                fs.create_dir(&directory)
-                    .await
-                    .context("create notebook LSP cache directory")?;
-                fs.write(&absolute_path, &[])
-                    .await
-                    .context("create virtual notebook document")?;
-                // The virtual document lives in the cache directory, and language servers
-                // resolve imports relative to the importing file first, so the modules
-                // next to the notebook are linked in beside it.
-                if let Some(notebook_directory) = notebook_path.parent() {
-                    link_sibling_modules(fs.as_ref(), notebook_directory, &directory, &absolute_path)
+                    let fs = project.read_with(cx, |project, _| project.fs().clone());
+                    fs.create_dir(&directory)
+                        .await
+                        .context("create notebook LSP cache directory")?;
+                    fs.write(&absolute_path, &[])
+                        .await
+                        .context("create virtual notebook document")?;
+                    // The virtual document lives in the cache directory, and language servers
+                    // resolve imports relative to the importing file first, so the modules
+                    // next to the notebook are linked in beside it.
+                    if let Some(notebook_directory) = notebook_path.parent() {
+                        link_sibling_modules(
+                            fs.as_ref(),
+                            notebook_directory,
+                            &directory,
+                            &absolute_path,
+                        )
                         .await
                         .log_err();
-                }
-                log::info!(
-                    "notebook_lsp: virtual document at {}",
-                    absolute_path.display()
-                );
+                    }
+                    log::info!(
+                        "notebook_lsp: virtual document at {}",
+                        absolute_path.display()
+                    );
 
-                // Create a worktree rooted at the virtual file itself and use
-                // the returned relative path directly. Looking the worktree up
-                // again by the full file path is unreliable because the path
-                // used to create the worktree may be canonicalized differently.
-                let (worktree, relative_path) = project
-                    .update(cx, |project, cx| {
-                        project.find_or_create_worktree(&absolute_path, false, cx)
-                    })
-                    .await
-                    .context("create virtual notebook worktree")?;
+                    // Create a worktree rooted at the virtual file itself and use
+                    // the returned relative path directly. Looking the worktree up
+                    // again by the full file path is unreliable because the path
+                    // used to create the worktree may be canonicalized differently.
+                    project
+                        .update(cx, |project, cx| {
+                            project.find_or_create_worktree(&absolute_path, false, cx)
+                        })
+                        .await
+                        .context("create virtual notebook worktree")?
+                };
                 let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
                 log::info!(
-                    "notebook_lsp: worktree {:?} for {}",
+                    "notebook_lsp: worktree {:?} path {}",
                     worktree_id,
-                    absolute_path.display()
+                    relative_path.as_unix_str()
                 );
                 let project_path = ProjectPath {
                     worktree_id,
@@ -583,14 +642,9 @@ impl NotebookLsp {
                         project.open_buffer(project_path.clone(), cx)
                     })
                     .await
-                    .with_context(|| {
-                        format!("open virtual notebook buffer {}", absolute_path.display())
-                    })?;
+                    .context("open virtual notebook buffer")?;
                 buffer.update(cx, |buffer, cx| buffer.set_language(language.clone(), cx));
-                log::info!(
-                    "notebook_lsp: opened virtual buffer for {}",
-                    absolute_path.display()
-                );
+                log::info!("notebook_lsp: opened virtual buffer");
                 let lsp_handle = project.update(cx, |project, cx| {
                     project.register_buffer_with_language_servers(&buffer, cx)
                 });
