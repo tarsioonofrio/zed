@@ -10,7 +10,6 @@
 
 use std::{
     cell::RefCell,
-    hash::{Hash, Hasher},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -28,7 +27,7 @@ use editor::{
 use fs::Fs;
 use futures::{StreamExt as _, future::Shared};
 use gpui::{
-    App, BackgroundExecutor, Context, Entity, FutureExt, Subscription, Task, TaskExt, WeakEntity,
+    App, AsyncApp, BackgroundExecutor, Context, Entity, FutureExt, Subscription, Task, TaskExt, WeakEntity,
     Window,
 };
 use language::{
@@ -46,7 +45,7 @@ use project::{
         OpenLspBufferHandle,
     },
 };
-use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
+use util::{ResultExt, rel_path::RelPath};
 
 /// How long to wait after a cell edit before rewriting the virtual document,
 /// so that a burst of keystrokes results in a single document change.
@@ -288,7 +287,6 @@ pub struct NotebookLsp {
     project: Entity<Project>,
     notebook_path: PathBuf,
     language: Option<Arc<Language>>,
-    document_directory_override: Option<PathBuf>,
     document: Option<DocumentState>,
     cells: Vec<CellState>,
     python_interpreter: Option<PathBuf>,
@@ -297,18 +295,11 @@ pub struct NotebookLsp {
     _setup_task: Option<Task<()>>,
     _toolchain_task: Option<Task<()>>,
     _lsp_subscription: Subscription,
-    owns_remote_document: bool,
+    owns_document: bool,
 }
 
-/// Directory that holds the virtual document for the notebook at `notebook_path`.
-///
-/// Each notebook gets its own directory (namespaced by a hash of its path) so
-/// that two notebooks sharing a file stem never collide.
-fn document_directory_for(notebook_path: &Path) -> PathBuf {
-    paths::temp_dir()
-        .join("notebooks")
-        .join(format!("{:016x}", hash_path(notebook_path)))
-}
+/// Project-relative directory that holds the virtual documents of notebooks.
+const NOTEBOOK_DOCUMENT_DIRECTORY: &str = ".zed/notebook";
 
 async fn link_sibling_modules(
     fs: &dyn Fs,
@@ -343,19 +334,6 @@ impl NotebookLsp {
         language: Option<Arc<Language>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_document_directory(project, notebook_path, language, None, cx)
-    }
-
-    /// Like [`NotebookLsp::new`] but with an explicit directory for the virtual
-    /// document. Production passes `None` and the directory is derived from the
-    /// notebook path; tests override it so the document lands on the test fs.
-    fn new_with_document_directory(
-        project: Entity<Project>,
-        notebook_path: PathBuf,
-        language: Option<Arc<Language>>,
-        document_directory: Option<PathBuf>,
-        cx: &mut Context<Self>,
-    ) -> Self {
         let lsp_store = project.read(cx).lsp_store();
         let lsp_subscription = cx.subscribe(&lsp_store, |this, _lsp_store, event, cx| {
             if let LspStoreEvent::DiagnosticsUpdated { server_id, paths } = event {
@@ -371,7 +349,6 @@ impl NotebookLsp {
             project,
             notebook_path,
             language,
-            document_directory_override: document_directory,
             document: None,
             cells: Vec::new(),
             python_interpreter: None,
@@ -380,11 +357,11 @@ impl NotebookLsp {
             _setup_task: None,
             _toolchain_task: None,
             _lsp_subscription: lsp_subscription,
-            owns_remote_document: false,
+            owns_document: false,
         };
 
         cx.on_release(|this, cx| {
-            let (true, Some(document)) = (this.owns_remote_document, this.document.as_ref()) else {
+            let (true, Some(document)) = (this.owns_document, this.document.as_ref()) else {
                 return;
             };
             let path = document.path.clone();
@@ -530,7 +507,6 @@ impl NotebookLsp {
         let project = self.project.clone();
         let language = self.language.clone();
         let notebook_path = self.notebook_path.clone();
-        let document_directory = self.document_directory_override.clone();
 
         let setup_task = cx.spawn(async move |this, cx| {
             let setup = async {
@@ -544,99 +520,107 @@ impl NotebookLsp {
                     .and_then(|stem| stem.to_str())
                     .unwrap_or("notebook")
                     .to_string();
-                let is_remote = project.read_with(cx, |project, _| project.is_via_remote_server());
-                let (worktree, relative_path) = if is_remote {
-                    // The language servers run on the remote machine, so the virtual
-                    // document is an unsaved buffer beside the notebook there: it never
-                    // exists on disk and the project's own config and modules resolve.
-                    let notebook_directory = notebook_path
-                        .parent()
-                        .context("remote notebook has no parent directory")?;
-                    let (worktree, directory_path) = project
+                let notebook_directory = notebook_path
+                    .parent()
+                    .context("notebook has no parent directory")?
+                    .to_path_buf();
+                // The document lives under `.zed/notebook` in the project that holds the
+                // notebook, mirroring the notebook's own directory so two notebooks never
+                // collide. Language servers then see the project's real config and, being
+                // inside the project, run wherever the project does (including SSH hosts).
+                let root = project
+                    .read_with(cx, |project, cx| {
+                        project.find_worktree(&notebook_path, cx).and_then(|(tree, _)| {
+                            let tree = tree.read(cx);
+                            (!tree.is_single_file()).then(|| tree.abs_path().to_path_buf())
+                        })
+                    })
+                    .unwrap_or_else(|| notebook_directory.clone());
+                let (worktree, root_path) = project
+                    .update(cx, |project, cx| {
+                        project.find_or_create_worktree(&root, false, cx)
+                    })
+                    .await
+                    .context("find worktree of the notebook")?;
+                let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+                let path_style = project.read_with(cx, |project, cx| project.path_style(cx));
+                let relative_directory = notebook_directory
+                    .strip_prefix(&root)
+                    .unwrap_or(Path::new(""));
+                let layout = Path::new(NOTEBOOK_DOCUMENT_DIRECTORY)
+                    .join(relative_directory)
+                    .join(format!("{stem}.{extension}"));
+                let relative_path: Arc<RelPath> = root_path
+                    .join(&RelPath::new(&layout, path_style)?)
+                    .into();
+                let ignore_path = ProjectPath {
+                    worktree_id,
+                    path: root_path
+                        .join(&RelPath::new(
+                            &Path::new(NOTEBOOK_DOCUMENT_DIRECTORY).join(".gitignore"),
+                            path_style,
+                        )?)
+                        .into(),
+                };
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: relative_path.clone(),
+                };
+
+                // Remote servers only open (and serve language servers for) files that
+                // exist, so the document is a real empty file, removed on release.
+                let exists = |path: &ProjectPath, cx: &mut AsyncApp| {
+                    project.read_with(cx, |project, cx| project.entry_for_path(path, cx).is_some())
+                };
+                if !exists(&ignore_path, cx) {
+                    // Self-ignoring directory: the files are internal, so git, project
+                    // search and the file finder skip them. Deleting this file opts out.
+                    project
                         .update(cx, |project, cx| {
-                            project.find_or_create_worktree(notebook_directory, false, cx)
+                            project.create_entry(ignore_path.clone(), false, cx)
                         })
                         .await
-                        .context("find worktree of the remote notebook")?;
-                    let file_name = format!(".{stem}.notebook.{extension}");
-                    let file_name = RelPath::new(Path::new(&file_name), PathStyle::Unix)?;
-                    let relative_path: Arc<RelPath> = directory_path.join(&file_name).into();
-                    // The remote server only opens (and serves language servers for) files
-                    // that exist, so an empty placeholder is created and removed on release.
-                    let project_path = ProjectPath {
-                        worktree_id: worktree.read_with(cx, |worktree, _| worktree.id()),
-                        path: relative_path.clone(),
-                    };
-                    let exists = project.read_with(cx, |project, cx| {
-                        project.entry_for_path(&project_path, cx).is_some()
-                    });
-                    if !exists {
-                        project
-                            .update(cx, |project, cx| {
-                                project.create_entry(project_path, false, cx)
-                            })
-                            .await
-                            .context("create remote virtual document")?;
-                        this.update(cx, |this, _| this.owns_remote_document = true)?;
-                    }
-                    log::info!(
-                        "notebook_lsp: remote virtual document {} beside {}",
-                        file_name.as_unix_str(),
-                        notebook_path.display()
-                    );
-                    (worktree, relative_path)
-                } else {
-                    let directory = document_directory
-                        .unwrap_or_else(|| document_directory_for(&notebook_path));
-                    let absolute_path = directory.join(format!("{stem}.{extension}"));
-
-                    let fs = project.read_with(cx, |project, _| project.fs().clone());
-                    fs.create_dir(&directory)
-                        .await
-                        .context("create notebook LSP cache directory")?;
-                    fs.write(&absolute_path, &[])
+                        .context("create notebook document ignore file")?;
+                    let ignore_buffer = project
+                        .update(cx, |project, cx| project.open_buffer(ignore_path.clone(), cx))
+                        .await?;
+                    ignore_buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "*\n")], None, cx));
+                    project
+                        .update(cx, |project, cx| project.save_buffer(ignore_buffer, cx))
+                        .await?;
+                }
+                if !exists(&project_path, cx) {
+                    project
+                        .update(cx, |project, cx| {
+                            project.create_entry(project_path.clone(), false, cx)
+                        })
                         .await
                         .context("create virtual notebook document")?;
-                    // The virtual document lives in the cache directory, and language servers
-                    // resolve imports relative to the importing file first, so the modules
-                    // next to the notebook are linked in beside it.
-                    if let Some(notebook_directory) = notebook_path.parent() {
+                    this.update(cx, |this, _| this.owns_document = true)?;
+                }
+
+                let is_remote = project.read_with(cx, |project, _| project.is_via_remote_server());
+                if !is_remote {
+                    // Language servers resolve imports relative to the importing file first,
+                    // so the modules next to the notebook are linked in beside the document.
+                    let document_path = root.join(&layout);
+                    if let Some(document_directory) = document_path.parent() {
+                        let fs = project.read_with(cx, |project, _| project.fs().clone());
                         link_sibling_modules(
                             fs.as_ref(),
-                            notebook_directory,
-                            &directory,
-                            &absolute_path,
+                            &notebook_directory,
+                            document_directory,
+                            &document_path,
                         )
                         .await
                         .log_err();
                     }
-                    log::info!(
-                        "notebook_lsp: virtual document at {}",
-                        absolute_path.display()
-                    );
-
-                    // Create a worktree rooted at the virtual file itself and use
-                    // the returned relative path directly. Looking the worktree up
-                    // again by the full file path is unreliable because the path
-                    // used to create the worktree may be canonicalized differently.
-                    project
-                        .update(cx, |project, cx| {
-                            project.find_or_create_worktree(&absolute_path, false, cx)
-                        })
-                        .await
-                        .context("create virtual notebook worktree")?
-                };
-                let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+                }
                 log::info!(
-                    "notebook_lsp: worktree {:?} path {}",
-                    worktree_id,
-                    relative_path.as_unix_str()
+                    "notebook_lsp: virtual document {} for {}",
+                    relative_path.as_unix_str(),
+                    notebook_path.display()
                 );
-                let project_path = ProjectPath {
-                    worktree_id,
-                    path: relative_path,
-                };
-
                 let buffer = project
                     .update(cx, |project, cx| {
                         project.open_buffer(project_path.clone(), cx)
@@ -914,12 +898,6 @@ impl NotebookLsp {
             cell_buffer.update(cx, |buffer, cx| buffer.update_diagnostics(server_id, set, cx));
         }
     }
-}
-
-fn hash_path(path: &Path) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn translate_anchor(
@@ -2167,17 +2145,16 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/notebooks")).await.unwrap();
         let project = Project::test(fs.clone(), [] as [&Path; 0], cx).await;
 
         let notebook_path = PathBuf::from("/notebooks/demo.ipynb");
-        let document_directory = PathBuf::from("/notebook_lsp_cache");
         let notebook = cx.update(|cx| {
             cx.new(|cx| {
-                NotebookLsp::new_with_document_directory(
+                NotebookLsp::new(
                     project.clone(),
                     notebook_path,
                     None,
-                    Some(document_directory),
                     cx,
                 )
             })
@@ -2222,6 +2199,58 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn virtual_document_mirrors_the_notebook_directory_under_zed_notebook(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/repo",
+            serde_json::json!({ "sub": { "nested": { "analysis.ipynb": "" } } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new("/repo")], cx).await;
+        let notebook = cx.update(|cx| {
+            cx.new(|cx| {
+                NotebookLsp::new(
+                    project.clone(),
+                    PathBuf::from("/repo/sub/nested/analysis.ipynb"),
+                    None,
+                    cx,
+                )
+            })
+        });
+        let setup_task = notebook
+            .update(cx, |notebook, _| notebook._setup_task.take())
+            .expect("notebook LSP setup task should have been spawned");
+        setup_task.await;
+        cx.run_until_parked();
+
+        let document_path = Path::new("/repo/.zed/notebook/sub/nested/analysis.txt");
+        assert!(fs.is_file(document_path).await);
+        assert_eq!(
+            fs.load(Path::new("/repo/.zed/notebook/.gitignore"))
+                .await
+                .unwrap(),
+            "*\n"
+        );
+
+        cx.update(|_| drop(notebook));
+        cx.run_until_parked();
+        assert!(!fs.is_file(document_path).await);
+        assert!(
+            fs.is_file(Path::new("/repo/.zed/notebook/.gitignore"))
+                .await
+        );
+    }
+
+    #[gpui::test]
     async fn is_completion_trigger_uses_document_triggers_and_local_classifier(
         cx: &mut TestAppContext,
     ) {
@@ -2233,15 +2262,15 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/notebooks")).await.unwrap();
         let project = Project::test(fs.clone(), [] as [&Path; 0], cx).await;
 
         let notebook = cx.update(|cx| {
             cx.new(|cx| {
-                NotebookLsp::new_with_document_directory(
+                NotebookLsp::new(
                     project.clone(),
                     PathBuf::from("/notebooks/trigger.ipynb"),
                     None,
-                    Some(PathBuf::from("/notebook_lsp_cache_trigger")),
                     cx,
                 )
             })
@@ -2543,6 +2572,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/notebooks")).await.unwrap();
         let project = Project::test(fs.clone(), [] as [&Path; 0], cx).await;
         let languages = project.read_with(cx, |project, _| project.languages().clone());
         let python = test_python_language();
@@ -2551,11 +2581,10 @@ mod tests {
 
         let notebook = cx.update(|cx| {
             cx.new(|cx| {
-                NotebookLsp::new_with_document_directory(
+                NotebookLsp::new(
                     project.clone(),
                     PathBuf::from(format!("/notebooks/{name}.ipynb")),
                     Some(python.clone()),
-                    Some(PathBuf::from(format!("/notebook_lsp_cache_{name}"))),
                     cx,
                 )
             })
@@ -2834,14 +2863,14 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/notebooks")).await.unwrap();
         let project = Project::test(fs.clone(), [] as [&Path; 0], cx).await;
 
         let notebook = cx.new(|cx| {
-            NotebookLsp::new_with_document_directory(
+            NotebookLsp::new(
                 project,
                 PathBuf::from("/notebooks/env.ipynb"),
                 None,
-                Some(PathBuf::from("/notebook_lsp_cache_env")),
                 cx,
             )
         });
@@ -3104,14 +3133,14 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/notebooks")).await.unwrap();
         let project = Project::test(fs.clone(), [] as [&Path; 0], cx).await;
         let notebook = cx.update(|cx| {
             cx.new(|cx| {
-                NotebookLsp::new_with_document_directory(
+                NotebookLsp::new(
                     project.clone(),
                     PathBuf::from(format!("/notebooks/{paths}.ipynb")),
                     None,
-                    Some(PathBuf::from(format!("/notebook_lsp_cache_{paths}"))),
                     cx,
                 )
             })
