@@ -1,4 +1,5 @@
 pub mod html;
+mod math;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -11,6 +12,7 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
+use math::{MathExpression, MathState};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -46,7 +48,7 @@ use language::{
 use parser::CodeBlockMetadata;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
-    parse_markdown_with_options,
+    parse_markdown_with_math, parse_markdown_with_options,
 };
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use sum_tree::TreeMap;
@@ -502,6 +504,7 @@ pub struct Markdown {
     fallback_code_block_language: Option<LanguageName>,
     options: MarkdownOptions,
     mermaid_state: MermaidState,
+    math_state: MathState,
     _mermaid_theme_subscription: Option<Subscription>,
     /// Per-diagram view state (current tab, zoom, scroll position, and pending
     /// debounced re-raster) keyed by source offset. Distinct from
@@ -524,6 +527,7 @@ pub struct MarkdownOptions {
     pub parse_links_only: bool,
     pub parse_html: bool,
     pub render_mermaid_diagrams: bool,
+    pub render_math: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
     /// Defers parsing until the first [`MarkdownElement`] layout or [`Markdown::ensure_parsed`].
@@ -696,10 +700,11 @@ impl Markdown {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        let theme_subscription = if options.render_mermaid_diagrams {
+        let theme_subscription = if options.render_mermaid_diagrams || options.render_math {
             Some(
                 cx.observe_global::<theme::GlobalTheme>(|this: &mut Self, cx| {
                     this.invalidate_mermaid_cache(cx);
+                    this.invalidate_math_cache(cx);
                 }),
             )
         } else {
@@ -723,6 +728,7 @@ impl Markdown {
             fallback_code_block_language,
             options,
             mermaid_state: MermaidState::default(),
+            math_state: MathState::default(),
             _mermaid_theme_subscription: theme_subscription,
             mermaid_views: HashMap::default(),
             copied_code_blocks: HashSet::default(),
@@ -792,6 +798,15 @@ impl Markdown {
             },
             cx,
         );
+        cx.notify();
+    }
+
+    pub fn invalidate_math_cache(&mut self, cx: &mut Context<Self>) {
+        if !self.options.render_math || self.parsed_markdown.events.is_empty() {
+            return;
+        }
+        let parsed_markdown = self.parsed_markdown.clone();
+        self.math_state.update(&parsed_markdown, cx);
         cx.notify();
     }
 
@@ -1254,6 +1269,7 @@ impl Markdown {
             self.active_root_block = None;
             self.images_by_source_offset.clear();
             self.mermaid_state.clear(cx);
+            self.math_state.clear(cx);
             cx.notify();
             cx.refresh_windows();
             return;
@@ -1272,6 +1288,7 @@ impl Markdown {
         let should_parse_links_only = self.options.parse_links_only;
         let should_parse_html = self.options.parse_html;
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
+        let should_render_math = self.options.render_math;
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
         let language_registry = self.language_registry.clone();
@@ -1299,12 +1316,22 @@ impl Markdown {
                 );
             }
 
-            let parsed = parse_markdown_with_options(
-                &source,
-                should_parse_html,
-                should_parse_heading_slugs,
-                should_parse_metadata_blocks,
-            );
+            let parsed = if should_render_math {
+                parse_markdown_with_math(
+                    &source,
+                    should_parse_html,
+                    should_parse_heading_slugs,
+                    should_parse_metadata_blocks,
+                    true,
+                )
+            } else {
+                parse_markdown_with_options(
+                    &source,
+                    should_parse_html,
+                    should_parse_heading_slugs,
+                    should_parse_metadata_blocks,
+                )
+            };
             let events = parsed.events;
             let language_names = parsed.language_names;
             let paths = parsed.language_paths;
@@ -1424,6 +1451,12 @@ impl Markdown {
                 } else {
                     this.mermaid_state.clear(cx);
                     this.mermaid_views.clear();
+                }
+                if this.options.render_math {
+                    let parsed_markdown = this.parsed_markdown.clone();
+                    this.math_state.update(&parsed_markdown, cx);
+                } else {
+                    this.math_state.clear(cx);
                 }
                 this.pending_parse.take();
                 if this.should_reparse {
@@ -2666,7 +2699,14 @@ impl Element for MarkdownElement {
             }
         };
 
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+        let (
+            parsed_markdown,
+            images,
+            active_root_block,
+            render_mermaid_diagrams,
+            mermaid_state,
+            math_state,
+        ) = {
             let markdown = self.markdown.read(cx);
             (
                 markdown.parsed_markdown.clone(),
@@ -2674,6 +2714,7 @@ impl Element for MarkdownElement {
                 markdown.active_root_block,
                 markdown.options.render_mermaid_diagrams,
                 markdown.mermaid_state.clone(),
+                markdown.math_state.clone(),
             )
         };
         let mut builder = MarkdownElementBuilder::new(
@@ -3408,6 +3449,26 @@ impl Element for MarkdownElement {
                     builder.push_text_style(self.style.link.clone());
                     builder.push_text(&format!("[{label}]"), range.clone());
                     builder.pop_text_style();
+                }
+                MarkdownEvent::InlineMath(latex) => {
+                    let expression = MathExpression::new(latex.clone(), false);
+                    let fallback = parsed_markdown.source[range.clone()].into();
+                    let element = math::render_math(&math_state, &expression, fallback);
+                    builder.push_image_child(element);
+                }
+                MarkdownEvent::DisplayMath(latex) => {
+                    let expression = MathExpression::new(latex.clone(), true);
+                    let fallback = parsed_markdown.source[range.clone()].into();
+                    let element = math::render_math(&math_state, &expression, fallback);
+                    builder.push_sourced_element(
+                        range.clone(),
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(element)
+                            .into_any_element(),
+                    );
                 }
             }
         }

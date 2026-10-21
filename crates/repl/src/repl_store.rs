@@ -12,7 +12,6 @@ use language::{Language, LanguageName};
 use project::{Fs, Project, ProjectPath, WorktreeId};
 use remote::RemoteConnectionOptions;
 use settings::{Settings, SettingsStore};
-use util::rel_path::RelPath;
 
 use crate::kernels::{
     Kernel, PythonEnvKernelSpecification, list_remote_kernelspecs, local_kernel_specifications,
@@ -32,9 +31,10 @@ pub struct ReplStore {
     kernelspecs_initialized: bool,
     selected_kernel_for_worktree: HashMap<WorktreeId, KernelSpecification>,
     kernel_specifications_for_worktree: HashMap<WorktreeId, Vec<KernelSpecification>>,
+    additional_kernel_specifications_for_worktree: HashMap<WorktreeId, Vec<KernelSpecification>>,
     active_python_toolchain_for_worktree: HashMap<WorktreeId, SharedString>,
     remote_worktrees: HashSet<WorktreeId>,
-    fetching_python_kernelspecs: HashSet<WorktreeId>,
+    fetching_python_kernelspecs: HashSet<ProjectPath>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -66,6 +66,7 @@ impl ReplStore {
             kernelspecs_initialized: false,
             _subscriptions: subscriptions,
             kernel_specifications_for_worktree: HashMap::default(),
+            additional_kernel_specifications_for_worktree: HashMap::default(),
             selected_kernel_for_worktree: HashMap::default(),
             active_python_toolchain_for_worktree: HashMap::default(),
             remote_worktrees: HashSet::default(),
@@ -102,6 +103,12 @@ impl ReplStore {
             .get(&worktree_id)
             .into_iter()
             .flat_map(|specs| specs.iter())
+            .chain(
+                self.additional_kernel_specifications_for_worktree
+                    .get(&worktree_id)
+                    .into_iter()
+                    .flat_map(|specs| specs.iter()),
+            )
             .chain(global_specs.into_iter().flatten())
     }
 
@@ -138,6 +145,26 @@ impl ReplStore {
         cx.notify();
     }
 
+    /// Adds an environment discovered outside the worktree traversal (for
+    /// example a `.venv` in a parent directory of a notebook) so the kernel
+    /// picker and notebook adoption can see it.
+    pub fn add_discovered_kernel_specification(
+        &mut self,
+        worktree_id: WorktreeId,
+        specification: KernelSpecification,
+        cx: &mut Context<Self>,
+    ) {
+        let specifications = self
+            .additional_kernel_specifications_for_worktree
+            .entry(worktree_id)
+            .or_default();
+        if specifications.contains(&specification) {
+            return;
+        }
+        specifications.push(specification);
+        cx.notify();
+    }
+
     pub fn mark_ipykernel_installed(
         &mut self,
         cx: &mut Context<Self>,
@@ -157,13 +184,17 @@ impl ReplStore {
 
     pub fn refresh_python_kernelspecs(
         &mut self,
-        worktree_id: WorktreeId,
+        project_path: ProjectPath,
         project: &Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if !self.fetching_python_kernelspecs.insert(worktree_id) {
+        let worktree_id = project_path.worktree_id;
+        // Keyed by path, not worktree: notebooks in different directories of one
+        // worktree can have different nearest environments and must not skip each other.
+        if !self.fetching_python_kernelspecs.insert(project_path.clone()) {
             return Task::ready(Ok(()));
         }
+        let fetching_path = project_path.clone();
 
         let is_remote = project.read(cx).is_remote();
         // WSL does require access to global kernel specs, so we only exclude remote worktrees that aren't WSL.
@@ -174,21 +205,18 @@ impl ReplStore {
             .map_or(false, |opts| {
                 matches!(opts, RemoteConnectionOptions::Wsl(_))
             });
-        let kernel_specifications_task = python_env_kernel_specifications(project, worktree_id, cx);
-        let active_toolchain = project.read(cx).active_toolchain(
-            ProjectPath {
-                worktree_id,
-                path: RelPath::empty_arc(),
-            },
-            LanguageName::new_static("Python"),
-            cx,
-        );
+        let kernel_specifications_task =
+            python_env_kernel_specifications(project, worktree_id, project_path.path.clone(), cx);
+        let active_toolchain =
+            project
+                .read(cx)
+                .active_toolchain(project_path, LanguageName::new_static("Python"), cx);
 
         cx.spawn(async move |this, cx| {
             let kernel_specifications_res = kernel_specifications_task.await;
 
             this.update(cx, |this, _cx| {
-                this.fetching_python_kernelspecs.remove(&worktree_id);
+                this.fetching_python_kernelspecs.remove(&fetching_path);
             })
             .ok();
 

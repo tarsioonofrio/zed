@@ -1360,7 +1360,13 @@ impl Editor {
             .head();
 
         let (buffer, head) = multi_buffer.text_anchor_for_position(head, cx)?;
-        let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
+        let references = match &self.semantics_provider {
+            Some(provider) => provider.references(&buffer, head, cx),
+            None => None,
+        }
+        .unwrap_or_else(|| {
+            project.update(cx, |project, cx| project.references(&buffer, head, cx))
+        });
         // Keep every reference, including the one under the cursor, to match the
         // default `find_all_references` multibuffer (`always_open_multibuffer`).
         Some(cx.spawn(async move |_, _| Ok(references.await?.unwrap_or_default())))
@@ -1406,8 +1412,14 @@ impl Editor {
 
         let (buffer, head) = multi_buffer.text_anchor_for_position(head, cx)?;
         let workspace = self.workspace()?;
-        let project = workspace.read(cx).project().clone();
-        let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
+        let references = match &self.semantics_provider {
+            Some(provider) => provider.references(&buffer, head, cx),
+            None => None,
+        }
+        .unwrap_or_else(|| {
+            let project = workspace.read(cx).project().clone();
+            project.update(cx, |project, cx| project.references(&buffer, head, cx))
+        });
         Some(cx.spawn_in(window, async move |editor, cx| {
             let _cleanup = cx.on_drop(&editor, move |editor, cx| {
                 let multi_buffer_snapshot = editor.buffer.read(cx).snapshot(cx);

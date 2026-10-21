@@ -36,7 +36,7 @@ use project::{
 };
 use rope::Point;
 use settings::Settings;
-use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
+use std::{cmp::min, fmt::Write, ops::Range, ops::RangeInclusive, rc::Rc, sync::Arc};
 use text::LineEnding;
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, prelude::*};
@@ -1089,6 +1089,17 @@ impl MessageEditor {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+
+        if let Some(clipboard_text) = clipboard.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::String(text) => Some(text.text().to_string()),
+            _ => None,
+        }) && let Some((reference, line_range)) =
+            notebook_cell_context::registry(cx).take_matching_copy(&clipboard_text)
+        {
+            self.insert_notebook_cell_mention(clipboard_text, &reference, line_range, window, cx);
+            return;
+        }
+
         let editor_clipboard_selections =
             clipboard.entries().iter().find_map(|entry| match entry {
                 ClipboardEntry::String(text) => {
@@ -1330,6 +1341,73 @@ impl MessageEditor {
 
         self.editor.update(cx, |editor, cx| {
             editor.paste_item(clipboard, window, cx);
+        });
+    }
+
+    /// Re-inserts a copied notebook cell as a labelled crease, restoring the
+    /// `notebook.ipynb:N` mention the copy came from.
+    fn insert_notebook_cell_mention(
+        &mut self,
+        text: String,
+        reference: &notebook_cell_context::NotebookCellReference,
+        line_range: RangeInclusive<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_whole_cell =
+            *line_range.start() == 0 && *line_range.end() + 1 >= reference.cell_line_count;
+        let mention_uri = MentionUri::NotebookCell {
+            abs_path: reference.notebook_path.clone(),
+            cell_number: reference.cell_number,
+            line_range: (!is_whole_cell).then(|| line_range.clone()),
+        };
+        let mention_text = mention_uri.as_link().to_string();
+
+        let insertion_target = {
+            let editor = self.editor.read(cx);
+            let buffer = editor.buffer().read(cx);
+            let snapshot = buffer.snapshot(cx);
+            let Some(buffer_snapshot) = snapshot.as_singleton() else {
+                return;
+            };
+            let Some((anchor, _)) =
+                snapshot.anchor_to_buffer_anchor(editor.selections.newest_anchor().start)
+            else {
+                return;
+            };
+            anchor.bias_left(buffer_snapshot)
+        };
+
+        let content_len = self.editor.update(cx, |editor, cx| {
+            editor.insert(&mention_text, window, cx);
+            editor.insert(" ", window, cx);
+            mention_text.len()
+        });
+
+        let Some((crease_id, tx, crease_entity)) = insert_crease_for_mention(
+            insertion_target,
+            content_len,
+            mention_uri.name().into(),
+            mention_uri.icon_path(cx),
+            mention_uri.tooltip_text(),
+            Some(mention_uri.clone()),
+            Some(self.workspace.clone()),
+            None,
+            self.editor.clone(),
+            window,
+            cx,
+        ) else {
+            return;
+        };
+        drop(tx);
+
+        let mention_task = Task::ready(Ok::<_, String>(Mention::Text {
+            content: text,
+            tracked_buffers: Vec::new(),
+        }))
+        .shared();
+        self.mention_set.update(cx, |mention_set, cx| {
+            mention_set.insert_mention(crease_id, mention_uri, mention_task, crease_entity, cx)
         });
     }
 

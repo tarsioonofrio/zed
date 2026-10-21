@@ -58,6 +58,14 @@ pub enum MentionUri {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<u32>,
     },
+    NotebookCell {
+        abs_path: PathBuf,
+        /// 1-based position of the cell in the notebook.
+        cell_number: usize,
+        /// Range relative to the start of the cell; `None` means the whole cell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line_range: Option<RangeInclusive<u32>>,
+    },
     Fetch {
         url: Url,
     },
@@ -216,6 +224,20 @@ impl MentionUri {
                     Ok(Self::Directory {
                         abs_path: path.into(),
                     })
+                } else if path.starts_with("/agent/notebook-cell") {
+                    validate_query_params(&url, &["path", "cell"])?;
+                    let abs_path =
+                        query_param(&url, "path").context("Missing path for notebook cell")?;
+                    let cell_number = query_param(&url, "cell")
+                        .context("Missing cell number for notebook cell")?
+                        .parse::<usize>()
+                        .context("Invalid cell number for notebook cell")?;
+                    let line_range = url.fragment().map(parse_line_range).transpose()?;
+                    Ok(Self::NotebookCell {
+                        abs_path: abs_path.into(),
+                        cell_number,
+                        line_range,
+                    })
                 } else if path.starts_with("/agent/selection") {
                     validate_query_params(&url, &["path", "column"])?;
                     let fragment = url.fragment().context("Missing fragment for selection")?;
@@ -318,6 +340,7 @@ impl MentionUri {
             MentionUri::File { abs_path }
             | MentionUri::Directory { abs_path }
             | MentionUri::Symbol { abs_path, .. } => Some(abs_path),
+            MentionUri::NotebookCell { abs_path, .. } => Some(abs_path),
             MentionUri::Selection { abs_path, .. } => abs_path.as_deref(),
             MentionUri::Skill {
                 skill_file_path, ..
@@ -365,6 +388,11 @@ impl MentionUri {
                 line_range,
                 ..
             } => selection_name(path.as_deref(), line_range),
+            MentionUri::NotebookCell {
+                abs_path,
+                cell_number,
+                line_range,
+            } => notebook_cell_name(abs_path, *cell_number, line_range.as_ref()),
             MentionUri::Fetch { url } => url.to_string(),
             MentionUri::Skill { name, .. } => name.clone(),
         }
@@ -430,6 +458,11 @@ impl MentionUri {
             MentionUri::Skill {
                 skill_file_path, ..
             } => Some(skill_file_path.to_string_lossy().into_owned().into()),
+            MentionUri::NotebookCell {
+                abs_path,
+                cell_number,
+                line_range,
+            } => Some(notebook_cell_tooltip_text(abs_path, *cell_number, line_range.as_ref()).into()),
             _ => None,
         }
     }
@@ -448,6 +481,7 @@ impl MentionUri {
             MentionUri::Diagnostics { .. } => IconName::Warning.path().into(),
             MentionUri::TerminalSelection { .. } => IconName::Terminal.path().into(),
             MentionUri::Selection { .. } => IconName::Reader.path().into(),
+            MentionUri::NotebookCell { .. } => IconName::Book.path().into(),
             MentionUri::Fetch { .. } => IconName::ToolWeb.path().into(),
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
@@ -519,6 +553,25 @@ impl MentionUri {
                     line_range.start() + 1,
                     line_range.end() + 1
                 )));
+                url
+            }
+            MentionUri::NotebookCell {
+                abs_path,
+                cell_number,
+                line_range,
+            } => {
+                let mut url = Url::parse("zed:///").unwrap();
+                url.set_path("/agent/notebook-cell");
+                url.query_pairs_mut()
+                    .append_pair("path", &abs_path.to_string_lossy())
+                    .append_pair("cell", &cell_number.to_string());
+                if let Some(line_range) = line_range {
+                    url.set_fragment(Some(&format!(
+                        "L{}:{}",
+                        line_range.start() + 1,
+                        line_range.end() + 1
+                    )));
+                }
                 url
             }
             MentionUri::Thread { name, id } => {
@@ -848,6 +901,43 @@ pub fn selection_name(path: Option<&Path>, line_range: &RangeInclusive<u32>) -> 
         *line_range.start() + 1,
         *line_range.end() + 1
     )
+}
+
+/// Formats a notebook cell reference as `file.ipynb:N`, optionally with a
+/// cell-relative line range as ` (a:b)`. A `None` range means the whole cell.
+fn notebook_cell_name(
+    abs_path: &Path,
+    cell_number: usize,
+    line_range: Option<&RangeInclusive<u32>>,
+) -> String {
+    let file_name = abs_path.file_name().unwrap_or_default().to_string_lossy();
+    let base = format!("{file_name}:{cell_number}");
+    match line_range {
+        Some(line_range) => format!(
+            "{base} ({}:{})",
+            *line_range.start() + 1,
+            *line_range.end() + 1
+        ),
+        None => base,
+    }
+}
+
+/// Formats the tooltip for a notebook cell mention so it reads as a cell
+/// reference rather than a `path:line` mention, e.g. `<path> — célula N`.
+fn notebook_cell_tooltip_text(
+    abs_path: &Path,
+    cell_number: usize,
+    line_range: Option<&RangeInclusive<u32>>,
+) -> String {
+    let base = format!("{} — célula {cell_number}", abs_path.display());
+    match line_range {
+        Some(line_range) => format!(
+            "{base} ({}:{})",
+            *line_range.start() + 1,
+            *line_range.end() + 1
+        ),
+        None => base,
+    }
 }
 
 /// Formats a 0-based, inclusive line range as a 1-based path suffix: `:5` for a
@@ -1792,6 +1882,62 @@ mod tests {
         };
         assert_eq!(root_file.disambiguated_name(1), "README.md");
         assert_eq!(root_file.disambiguated_name(5), "README.md");
+    }
+
+    #[test]
+    fn test_parse_notebook_cell_uri() {
+        let whole_cell = uri!("zed:///agent/notebook-cell?path=/project/analysis.ipynb&cell=3");
+        let parsed = MentionUri::parse(whole_cell, PathStyle::local()).unwrap();
+        assert_eq!(
+            parsed,
+            MentionUri::NotebookCell {
+                abs_path: PathBuf::from(path!("/project/analysis.ipynb")),
+                cell_number: 3,
+                line_range: None,
+            }
+        );
+        assert_eq!(
+            MentionUri::parse(parsed.to_uri().as_ref(), PathStyle::local()).unwrap(),
+            parsed
+        );
+        assert_eq!(parsed.name(), "analysis.ipynb:3");
+        assert_eq!(
+            parsed.tooltip_text().as_deref(),
+            Some("/project/analysis.ipynb — célula 3")
+        );
+
+        let partial =
+            uri!("zed:///agent/notebook-cell?path=/project/analysis.ipynb&cell=3#L2:5");
+        let parsed = MentionUri::parse(partial, PathStyle::local()).unwrap();
+        assert_eq!(
+            parsed,
+            MentionUri::NotebookCell {
+                abs_path: PathBuf::from(path!("/project/analysis.ipynb")),
+                cell_number: 3,
+                line_range: Some(1..=4),
+            }
+        );
+        assert_eq!(
+            MentionUri::parse(parsed.to_uri().as_ref(), PathStyle::local()).unwrap(),
+            parsed
+        );
+        assert_eq!(parsed.name(), "analysis.ipynb:3 (2:5)");
+        assert_eq!(
+            parsed.tooltip_text().as_deref(),
+            Some("/project/analysis.ipynb — célula 3 (2:5)")
+        );
+    }
+
+    #[test]
+    fn test_notebook_cell_uri_rejects_invalid_query_parameters() {
+        let invalid_extra = "zed:///agent/notebook-cell?path=/a.ipynb&cell=1&extra=1";
+        assert!(MentionUri::parse(invalid_extra, PathStyle::local()).is_err());
+
+        let missing_cell = "zed:///agent/notebook-cell?path=/a.ipynb";
+        assert!(MentionUri::parse(missing_cell, PathStyle::local()).is_err());
+
+        let invalid_cell = "zed:///agent/notebook-cell?path=/a.ipynb&cell=nope";
+        assert!(MentionUri::parse(invalid_cell, PathStyle::local()).is_err());
     }
 
     #[test]

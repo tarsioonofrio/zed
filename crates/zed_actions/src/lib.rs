@@ -961,6 +961,28 @@ pub mod notebook {
             RunAndAdvance,
             /// Clears all cell outputs.
             ClearOutputs,
+            /// Clears the current cell's outputs.
+            ClearCellOutputs,
+            /// Splits the current cell at the cursor.
+            SplitCell,
+            /// Merges the current cell with the cell above it.
+            MergeCellAbove,
+            /// Merges the current cell with the cell below it.
+            MergeCellBelow,
+            /// Converts the current cell to markdown.
+            ConvertCellToMarkdown,
+            /// Converts the current cell to code.
+            ConvertCellToCode,
+            /// Runs every code cell above the current cell.
+            RunAbove,
+            /// Runs every code cell below the current cell.
+            RunBelow,
+            /// Collapses or expands the current cell's outputs.
+            ToggleCellOutput,
+            /// Undoes the last notebook structure change.
+            Undo,
+            /// Redoes the last undone notebook structure change.
+            Redo,
             /// Moves the current cell up.
             MoveCellUp,
             /// Moves the current cell down.

@@ -57,6 +57,12 @@ const TOOLS: &[ToolInfo] = &[
         regex_explanation: "Patterns are matched independently against the source path and the destination path. Enter either path below to test.",
     },
     ToolInfo {
+        id: "notebook_edit_cell",
+        name: "Notebook Editing",
+        description: "Editing cells in Jupyter notebooks",
+        regex_explanation: "Patterns are matched against the notebook path being edited.",
+    },
+    ToolInfo {
         id: "create_directory",
         name: "Create Directory",
         description: "Directory creation",
@@ -1417,6 +1423,13 @@ mod tests {
             "list_directory",
             "open",
             "read_file",
+            "notebook_read",
+            // Notebook mutations all consult the shared "notebook_edit_cell"
+            // permission entry, mirroring how streaming_edit_file uses
+            // "edit_file".
+            "notebook_delete_cell",
+            "notebook_insert_cell",
+            "notebook_move_cell",
             "rename_symbol",
             "thinking",
             // streaming_edit_file uses "edit_file" for permission lookups,

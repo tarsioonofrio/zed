@@ -1758,6 +1758,13 @@
     },
   },
   {
+    "context": "NotebookEditor > Editor && mode == single_line",
+    "bindings": {
+      "enter": "editor::ConfirmRename",
+      "escape": "editor::Cancel",
+    },
+  },
+  {
     "context": "GitGraph",
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",

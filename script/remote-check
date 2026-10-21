@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Syncs the working tree to the remote build container (default workstation; REMOTE_CHECK_HOST/REMOTE_CHECK_ROOT override) and runs a command there.
+# The command runs detached on the server, so a dropped ssh connection does not
+# kill the build; this script reconnects and keeps following the log.
+# Usage: script/remote-check cargo check -p markdown -p repl
+set -euo pipefail
+export LC_ALL=C
+
+if [[ $# -eq 0 ]]; then
+    echo "usage: script/remote-check <command...>" >&2
+    exit 2
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+remote_host=${REMOTE_CHECK_HOST:-ssh-workstation}
+remote_root=${REMOTE_CHECK_ROOT:-/sim/tarsio.onofrio/zed-build}
+# A lane keeps its own source tree, target dir and logs so parallel workers do not collide.
+lane=${REMOTE_CHECK_LANE:-}
+work_name=work${lane:+-$lane}
+run_name=run${lane:+-$lane}
+quoted_command=$(printf '%q ' "$@")
+
+remote() {
+    "$remote_host" "$@" 2> >(grep -v 'post-quantum\|store now\|openssh.com' >&2)
+}
+
+# Missing tracked files (deleted locally) are skipped by --ignore-failed-read.
+git ls-files -co --exclude-standard -z \
+    | tar --null --ignore-failed-read -T - -czf - 2>/dev/null \
+    | remote "mkdir -p $remote_root/$work_name/src && find $remote_root/$work_name/src -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar -xzf - -C $remote_root/$work_name/src && mkdir -p $remote_root/$work_name/src/.git"
+
+remote "rm -f $remote_root/$run_name.exit && nohup bash -c 'LANE_WORK=$work_name $remote_root/enter.sh bash -c \"cd /work/src && CARGO_TARGET_DIR=/work/src/target RUSTUP_TOOLCHAIN=1.98.1 $quoted_command\" > $remote_root/$run_name.log 2>&1; echo \$? > $remote_root/$run_name.exit' > /dev/null 2>&1 < /dev/null &"
+
+offset=0
+while true; do
+    chunk=$(remote "tail -c +$((offset + 1)) $remote_root/$run_name.log 2>/dev/null | head -c 1000000; echo; echo ---EXIT---; cat $remote_root/$run_name.exit 2>/dev/null" 2>/dev/null) || { sleep 10; continue; }
+    log_part=${chunk%$'\n'---EXIT---*}
+    exit_code=${chunk##*---EXIT---}
+    exit_code=${exit_code//[$'\n ']/}
+    if [[ -n "$log_part" ]]; then
+        printf '%s\n' "$log_part"
+        offset=$((offset + ${#log_part}))
+    fi
+    if [[ -n "$exit_code" ]]; then
+        exit "$exit_code"
+    fi
+    sleep 5
+done

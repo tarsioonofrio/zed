@@ -19,6 +19,7 @@ mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
 mod move_path_tool;
+mod notebook_tools;
 mod read_file_tool;
 mod rename_tool;
 mod skill_tool;
@@ -88,6 +89,7 @@ pub use grep_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
 pub use move_path_tool::*;
+pub use notebook_tools::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
 pub use skill_tool::*;
@@ -214,6 +216,11 @@ tools! {
     ListAgentsAndModelsTool,
     ListDirectoryTool,
     MovePathTool,
+    NotebookDeleteCellTool,
+    NotebookEditCellTool,
+    NotebookInsertCellTool,
+    NotebookMoveCellTool,
+    NotebookReadTool,
     ReadFileTool,
     RenameTool,
     SkillTool,

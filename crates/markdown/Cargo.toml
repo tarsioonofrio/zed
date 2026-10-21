@@ -30,6 +30,10 @@ log.workspace = true
 markup5ever_rcdom.workspace = true
 mermaid_render.workspace = true
 pulldown-cmark.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-svg = { workspace = true, features = ["standalone", "embed-fonts"] }
+ratex-types.workspace = true
 settings.workspace = true
 smallvec.workspace = true
 stacksafe.workspace = true

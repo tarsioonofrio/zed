@@ -109,7 +109,7 @@ pub use buffer::*;
 pub use diagnostic::{
     Diagnostic, DiagnosticMessage, DiagnosticSourceKind, RelatedInformation, RelatedLocation,
 };
-pub use diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup};
+pub use diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup, DiagnosticSet};
 pub use language_registry::{
     BinaryStatus, LanguageNotFound, LanguageQueries, LanguageRegistry, QueryFile,
     QueryFileContents, QueryFiles,

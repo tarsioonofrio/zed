@@ -37,7 +37,9 @@ use editor::{Editor, MultiBuffer};
 use gpui::{AnyElement, ClipboardItem, Entity, EventEmitter, Render, WeakEntity};
 use language::Buffer;
 use menu;
-use runtimelib::{ExecutionState, JupyterMessage, JupyterMessageContent, MimeBundle, MimeType};
+use runtimelib::{
+    ExecutionState, JupyterMessage, JupyterMessageContent, MimeBundle, MimeType, Stdio,
+};
 use ui::{CommonAnimationExt, CopyButton, IconButton, Tooltip, prelude::*};
 
 mod image;
@@ -64,19 +66,47 @@ use workspace::Workspace;
 use crate::repl_settings::ReplSettings;
 use settings::Settings;
 
-/// When deciding what to render from a collection of mediatypes, we need to rank them in order of importance
+/// When deciding what to render from a collection of mediatypes, we need to rank them in order of importance.
+///
+/// Richer renderings are preferred over simpler ones (images > html > latex/markdown > json > plain).
+/// Media types that Zed cannot render (SVG, widgets, plotly, ...) rank 0 so an alternative is chosen,
+/// though the original bundle is still preserved when the output is serialized back to nbformat.
 fn rank_mime_type(mimetype: &MimeType) -> usize {
     match mimetype {
+        MimeType::Png(_) => 10,
+        MimeType::Jpeg(_) => 9,
+        MimeType::Gif(_) => 9,
+        MimeType::Html(_) => 8,
         MimeType::DataTable(_) => 7,
-        MimeType::Html(_) => 6,
-        MimeType::Json(_) => 5,
-        MimeType::Png(_) => 4,
-        MimeType::Jpeg(_) => 3,
-        MimeType::Markdown(_) => 2,
+        MimeType::Latex(_) => 6,
+        MimeType::Markdown(_) => 5,
+        MimeType::Json(_) => 4,
         MimeType::Plain(_) => 1,
         // All other media types are not supported in Zed at this time
         _ => 0,
     }
+}
+
+/// Media types that require JavaScript or a specialized interactive frontend to display.
+/// Zed cannot render these, but we still surface a placeholder (and any text alternative)
+/// rather than dropping the output entirely.
+fn is_interactive_mime_type(mimetype: &MimeType) -> bool {
+    matches!(
+        mimetype,
+        MimeType::Javascript(_)
+            | MimeType::Plotly(_)
+            | MimeType::WidgetView(_)
+            | MimeType::WidgetState(_)
+            | MimeType::VegaLiteV2(_)
+            | MimeType::VegaLiteV3(_)
+            | MimeType::VegaLiteV4(_)
+            | MimeType::VegaLiteV5(_)
+            | MimeType::VegaLiteV6(_)
+            | MimeType::VegaV3(_)
+            | MimeType::VegaV4(_)
+            | MimeType::VegaV5(_)
+            | MimeType::Vdom(_)
+    )
 }
 
 pub(crate) trait OutputContent {
@@ -114,67 +144,60 @@ pub enum Output {
     Plain {
         content: Entity<TerminalOutput>,
         display_id: Option<String>,
+        nbformat: Option<nbformat::v4::Output>,
     },
     Stream {
         content: Entity<TerminalOutput>,
+        name: String,
+        nbformat: Option<nbformat::v4::Output>,
     },
     Image {
         content: Entity<ImageView>,
         display_id: Option<String>,
+        nbformat: Option<nbformat::v4::Output>,
     },
-    ErrorOutput(ErrorView),
-    Message(String),
+    ErrorOutput {
+        content: ErrorView,
+        nbformat: Option<nbformat::v4::Output>,
+    },
+    Message {
+        text: String,
+        display_id: Option<String>,
+        nbformat: Option<nbformat::v4::Output>,
+    },
     Table {
         content: Entity<TableView>,
         display_id: Option<String>,
+        nbformat: Option<nbformat::v4::Output>,
     },
     Markdown {
         content: Entity<MarkdownView>,
         display_id: Option<String>,
+        nbformat: Option<nbformat::v4::Output>,
     },
     Json {
         content: Entity<JsonView>,
         display_id: Option<String>,
+        nbformat: Option<nbformat::v4::Output>,
     },
     ClearOutputWaitMarker,
 }
 
 impl Output {
-    pub fn to_nbformat(&self, cx: &App) -> Option<nbformat::v4::Output> {
+    /// The nbformat output that this view was built from, rewritten faithfully so
+    /// that saving a notebook never discards data. Types that Zed cannot render
+    /// keep their full media bundle, and the original ExecuteResult/DisplayData
+    /// distinction, execution count, metadata, and stream name are preserved.
+    pub fn to_nbformat(&self, _cx: &App) -> Option<nbformat::v4::Output> {
         match self {
-            Output::Stream { content } => {
-                let text = content.read(cx).full_text(cx);
-                Some(nbformat::v4::Output::Stream {
-                    name: "stdout".to_string(),
-                    text: nbformat::v4::MultilineString(text),
-                })
-            }
-            Output::Plain { content, .. } => {
-                let text = content.read(cx).full_text(cx);
-                let mut data = jupyter_protocol::media::Media::default();
-                data.content.push(jupyter_protocol::MediaType::Plain(text));
-                Some(nbformat::v4::Output::DisplayData(
-                    nbformat::v4::DisplayData {
-                        data,
-                        metadata: serde_json::Map::new(),
-                    },
-                ))
-            }
-            Output::ErrorOutput(error_view) => {
-                let traceback_text = error_view.traceback.read(cx).full_text(cx);
-                let traceback_lines: Vec<String> =
-                    traceback_text.lines().map(|s| s.to_string()).collect();
-                Some(nbformat::v4::Output::Error(nbformat::v4::ErrorOutput {
-                    ename: error_view.ename.clone(),
-                    evalue: error_view.evalue.clone(),
-                    traceback: traceback_lines,
-                }))
-            }
-            Output::Image { .. }
-            | Output::Markdown { .. }
-            | Output::Table { .. }
-            | Output::Json { .. } => None,
-            Output::Message(_) => None,
+            Output::Plain { nbformat, .. }
+            | Output::Stream { nbformat, .. }
+            | Output::Image { nbformat, .. }
+            | Output::Table { nbformat, .. }
+            | Output::Markdown { nbformat, .. }
+            | Output::Json { nbformat, .. } => nbformat.clone(),
+            Output::ErrorOutput { nbformat, .. } => nbformat.clone(),
+            Output::Message { nbformat, .. } => nbformat.clone(),
             Output::ClearOutputWaitMarker => None,
         }
     }
@@ -257,10 +280,10 @@ impl Output {
             Self::Markdown { content, .. } => Some(content.clone().into_any_element()),
             Self::Stream { content, .. } => Some(content.clone().into_any_element()),
             Self::Image { content, .. } => Some(content.clone().into_any_element()),
-            Self::Message(message) => Some(div().child(message.clone()).into_any_element()),
+            Self::Message { text, .. } => Some(div().child(text.clone()).into_any_element()),
             Self::Table { content, .. } => Some(content.clone().into_any_element()),
             Self::Json { content, .. } => Some(content.clone().into_any_element()),
-            Self::ErrorOutput(error_view) => error_view.render(window, cx),
+            Self::ErrorOutput { content, .. } => content.render(window, cx),
             Self::ClearOutputWaitMarker => None,
         }
     }
@@ -310,7 +333,7 @@ impl Output {
                 Self::Json { content, .. } => {
                     Self::render_output_controls(content.clone(), workspace, window, cx)
                 }
-                Self::ErrorOutput(err) => Some(
+                Self::ErrorOutput { content: err, .. } => Some(
                     h_flex()
                         .pl_1()
                         .child({
@@ -367,7 +390,7 @@ impl Output {
                         )
                         .into_any_element(),
                 ),
-                Self::Message(_) => None,
+                Self::Message { .. } => None,
                 Self::Table { content, .. } => {
                     Self::render_output_controls(content.clone(), workspace, window, cx)
                 }
@@ -380,8 +403,8 @@ impl Output {
             Output::Plain { display_id, .. } => display_id.clone(),
             Output::Stream { .. } => None,
             Output::Image { display_id, .. } => display_id.clone(),
-            Output::ErrorOutput(_) => None,
-            Output::Message(_) => None,
+            Output::ErrorOutput { .. } => None,
+            Output::Message { display_id, .. } => display_id.clone(),
             Output::Table { display_id, .. } => display_id.clone(),
             Output::Markdown { display_id, .. } => display_id.clone(),
             Output::Json { display_id, .. } => display_id.clone(),
@@ -392,38 +415,110 @@ impl Output {
     pub fn new(
         data: &MimeBundle,
         display_id: Option<String>,
+        nbformat_output: nbformat::v4::Output,
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
+        let mut output = Self::from_mime_bundle(data, display_id, window, cx);
+        output.set_nbformat(Some(nbformat_output));
+        output
+    }
+
+    fn set_nbformat(&mut self, output: Option<nbformat::v4::Output>) {
+        match self {
+            Output::Plain { nbformat, .. }
+            | Output::Stream { nbformat, .. }
+            | Output::Image { nbformat, .. }
+            | Output::Table { nbformat, .. }
+            | Output::Markdown { nbformat, .. }
+            | Output::Json { nbformat, .. }
+            | Output::Message { nbformat, .. }
+            | Output::ErrorOutput { nbformat, .. } => *nbformat = output,
+            Output::ClearOutputWaitMarker => {}
+        }
+    }
+
+    fn from_mime_bundle(
+        data: &MimeBundle,
+        display_id: Option<String>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        // Interactive outputs (widgets, plotly, vega, ...) cannot be rendered by Zed.
+        // Show a discreet placeholder that still surfaces a text alternative, while the
+        // full bundle is preserved on the `nbformat` field for a lossless save.
+        if let Some(interactive_mime) = data.content.iter().find(|media| is_interactive_mime_type(media))
+            && !data.richest(rank_mime_type).is_some_and(|media| rank_mime_type(media) > 1)
+        {
+            let placeholder = format!(
+                "Saída interativa não suportada ({})",
+                interactive_mime.mime_type()
+            );
+            let text = match plain_alternative(data) {
+                Some(plain) => {
+                    format!("{placeholder} — exibindo texto alternativo:\n{plain}")
+                }
+                None => placeholder,
+            };
+            return Output::Message {
+                text,
+                display_id,
+                nbformat: None,
+            };
+        }
+
         match data.richest(rank_mime_type) {
             Some(MimeType::Json(json_value)) => match JsonView::from_value(json_value.clone()) {
                 Ok(json_view) => Output::Json {
                     content: cx.new(|_| json_view),
                     display_id,
+                    nbformat: None,
                 },
-                Err(_) => Output::Message("Failed to parse JSON".to_string()),
+                Err(_) => Output::Message {
+                    text: "Failed to parse JSON".to_string(),
+                    display_id,
+                    nbformat: None,
+                },
             },
             Some(MimeType::Plain(text)) => Output::Plain {
                 content: cx.new(|cx| TerminalOutput::from(text, window, cx)),
                 display_id,
+                nbformat: None,
             },
             Some(MimeType::Markdown(text)) => {
                 let content = cx.new(|cx| MarkdownView::from(text.clone(), cx));
                 Output::Markdown {
                     content,
                     display_id,
+                    nbformat: None,
                 }
             }
-            Some(MimeType::Png(data)) | Some(MimeType::Jpeg(data)) => match ImageView::from(data) {
-                Ok(view) => Output::Image {
-                    content: cx.new(|_| view),
+            Some(MimeType::Latex(text)) => {
+                let content = cx.new(|cx| MarkdownView::from_latex(text.clone(), cx));
+                Output::Markdown {
+                    content,
                     display_id,
-                },
-                Err(error) => Output::Message(format!("Failed to load image: {}", error)),
-            },
+                    nbformat: None,
+                }
+            }
+            Some(MimeType::Png(data)) | Some(MimeType::Jpeg(data)) | Some(MimeType::Gif(data)) => {
+                match ImageView::from(data) {
+                    Ok(view) => Output::Image {
+                        content: cx.new(|_| view),
+                        display_id,
+                        nbformat: None,
+                    },
+                    Err(error) => Output::Message {
+                        text: format!("Failed to load image: {}", error),
+                        display_id,
+                        nbformat: None,
+                    },
+                }
+            }
             Some(MimeType::DataTable(data)) => Output::Table {
                 content: cx.new(|cx| TableView::new(data, window, cx)),
                 display_id,
+                nbformat: None,
             },
             Some(MimeType::Html(html_content)) => match html::html_to_markdown(html_content) {
                 Ok(markdown_text) => {
@@ -431,17 +526,30 @@ impl Output {
                     Output::Markdown {
                         content,
                         display_id,
+                        nbformat: None,
                     }
                 }
                 Err(_) => Output::Plain {
                     content: cx.new(|cx| TerminalOutput::from(html_content, window, cx)),
                     display_id,
+                    nbformat: None,
                 },
             },
             // Any other media types are not supported
-            _ => Output::Message("Unsupported media type".to_string()),
+            _ => Output::Message {
+                text: "Unsupported media type".to_string(),
+                display_id,
+                nbformat: None,
+            },
         }
     }
+}
+
+fn plain_alternative(data: &MimeBundle) -> Option<&String> {
+    data.content.iter().find_map(|media| match media {
+        MimeType::Plain(text) => Some(text),
+        _ => None,
+    })
 }
 
 #[derive(Default, Clone, Debug)]
@@ -511,7 +619,11 @@ impl ExecutionView {
             } else {
                 format!("{}{}", pending_input.prompt, value)
             };
-            self.outputs.push(Output::Message(display_text));
+            self.outputs.push(Output::Message {
+                text: display_text,
+                display_id: None,
+                nbformat: None,
+            });
 
             cx.emit(InputReplyEvent {
                 value,
@@ -562,18 +674,29 @@ impl ExecutionView {
             JupyterMessageContent::ExecuteResult(result) => Output::new(
                 &result.data,
                 result.transient.as_ref().and_then(|t| t.display_id.clone()),
+                nbformat::v4::Output::ExecuteResult(nbformat::v4::ExecuteResult {
+                    execution_count: result.execution_count,
+                    data: result.data.clone(),
+                    metadata: result.metadata.clone(),
+                }),
                 window,
                 cx,
             ),
             JupyterMessageContent::DisplayData(result) => Output::new(
                 &result.data,
                 result.transient.as_ref().and_then(|t| t.display_id.clone()),
+                nbformat::v4::Output::DisplayData(nbformat::v4::DisplayData {
+                    data: result.data.clone(),
+                    metadata: result.metadata.clone(),
+                }),
                 window,
                 cx,
             ),
             JupyterMessageContent::StreamContent(result) => {
                 // Previous stream data will combine together, handling colors, carriage returns, etc
-                if let Some(new_terminal) = self.apply_terminal_text(&result.text, window, cx) {
+                if let Some(new_terminal) =
+                    self.apply_terminal_text(&result.name, &result.text, window, cx)
+                {
                     new_terminal
                 } else {
                     return;
@@ -583,16 +706,32 @@ impl ExecutionView {
                 let terminal =
                     cx.new(|cx| TerminalOutput::from(&result.traceback.join("\n"), window, cx));
 
-                Output::ErrorOutput(ErrorView {
-                    ename: result.ename.clone(),
-                    evalue: result.evalue.clone(),
-                    traceback: terminal,
-                })
+                Output::ErrorOutput {
+                    content: ErrorView {
+                        ename: result.ename.clone(),
+                        evalue: result.evalue.clone(),
+                        traceback: terminal,
+                    },
+                    nbformat: Some(nbformat::v4::Output::Error(nbformat::v4::ErrorOutput {
+                        ename: result.ename.clone(),
+                        evalue: result.evalue.clone(),
+                        traceback: result.traceback.clone(),
+                    })),
+                }
             }
             JupyterMessageContent::ExecuteReply(reply) => {
                 for payload in reply.payload.iter() {
                     if let runtimelib::Payload::Page { data, .. } = payload {
-                        let output = Output::new(data, None, window, cx);
+                        let output = Output::new(
+                            data,
+                            None,
+                            nbformat::v4::Output::DisplayData(nbformat::v4::DisplayData {
+                                data: data.clone(),
+                                metadata: serde_json::Map::new(),
+                            }),
+                            window,
+                            cx,
+                        );
                         self.outputs.push(output);
                     }
                 }
@@ -660,6 +799,7 @@ impl ExecutionView {
     pub fn update_display_data(
         &mut self,
         data: &MimeBundle,
+        metadata: &serde_json::Map<String, serde_json::Value>,
         display_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -670,7 +810,16 @@ impl ExecutionView {
             if let Some(other_display_id) = output.display_id().as_ref()
                 && other_display_id == display_id
             {
-                *output = Output::new(data, Some(display_id.to_owned()), window, cx);
+                *output = Output::new(
+                    data,
+                    Some(display_id.to_owned()),
+                    nbformat::v4::Output::DisplayData(nbformat::v4::DisplayData {
+                        data: data.clone(),
+                        metadata: metadata.clone(),
+                    }),
+                    window,
+                    cx,
+                );
                 any = true;
             }
         });
@@ -711,14 +860,20 @@ impl ExecutionView {
 
     fn apply_terminal_text(
         &mut self,
+        name: &Stdio,
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Output> {
+        let name = stdio_name(name);
+
         if let Some(last_output) = self.outputs.last_mut()
             && let Output::Stream {
                 content: last_stream,
+                name: last_name,
+                nbformat,
             } = last_output
+            && *last_name == name
         {
             // Don't need to add a new output, we already have a terminal output
             // and can just update the most recent terminal output
@@ -726,12 +881,30 @@ impl ExecutionView {
                 last_stream.append_text(text, cx);
                 cx.notify();
             });
+            if let Some(nbformat::v4::Output::Stream {
+                text: stream_text, ..
+            }) = nbformat
+            {
+                stream_text.0.push_str(text);
+            }
             return None;
         }
 
         Some(Output::Stream {
             content: cx.new(|cx| TerminalOutput::from(text, window, cx)),
+            name: name.clone(),
+            nbformat: Some(nbformat::v4::Output::Stream {
+                name,
+                text: nbformat::v4::MultilineString(text.to_string()),
+            }),
         })
+    }
+}
+
+fn stdio_name(name: &Stdio) -> String {
+    match name {
+        Stdio::Stdout => "stdout".to_string(),
+        Stdio::Stderr => "stderr".to_string(),
     }
 }
 
@@ -739,7 +912,7 @@ impl ExecutionView {
     #[cfg(test)]
     fn output_as_stream_text(&self, cx: &App) -> Option<String> {
         self.outputs.iter().find_map(|output| {
-            if let Output::Stream { content } = output {
+            if let Output::Stream { content, .. } = output {
                 Some(content.read(cx).full_text(cx))
             } else {
                 None
@@ -854,37 +1027,41 @@ mod tests {
 
     #[test]
     fn test_rank_mime_type_ordering() {
-        let data_table = MimeType::DataTable(Box::default());
-        let html = MimeType::Html(String::new());
-        let json = MimeType::Json(serde_json::json!({}));
         let png = MimeType::Png(String::new());
         let jpeg = MimeType::Jpeg(String::new());
+        let gif = MimeType::Gif(String::new());
+        let html = MimeType::Html(String::new());
+        let data_table = MimeType::DataTable(Box::default());
+        let latex = MimeType::Latex(String::new());
         let markdown = MimeType::Markdown(String::new());
+        let json = MimeType::Json(serde_json::json!({}));
         let plain = MimeType::Plain(String::new());
 
+        assert_eq!(rank_mime_type(&png), 10);
+        assert_eq!(rank_mime_type(&jpeg), 9);
+        assert_eq!(rank_mime_type(&gif), 9);
+        assert_eq!(rank_mime_type(&html), 8);
         assert_eq!(rank_mime_type(&data_table), 7);
-        assert_eq!(rank_mime_type(&html), 6);
-        assert_eq!(rank_mime_type(&json), 5);
-        assert_eq!(rank_mime_type(&png), 4);
-        assert_eq!(rank_mime_type(&jpeg), 3);
-        assert_eq!(rank_mime_type(&markdown), 2);
+        assert_eq!(rank_mime_type(&latex), 6);
+        assert_eq!(rank_mime_type(&markdown), 5);
+        assert_eq!(rank_mime_type(&json), 4);
         assert_eq!(rank_mime_type(&plain), 1);
 
-        assert!(rank_mime_type(&data_table) > rank_mime_type(&html));
-        assert!(rank_mime_type(&html) > rank_mime_type(&json));
-        assert!(rank_mime_type(&json) > rank_mime_type(&png));
-        assert!(rank_mime_type(&png) > rank_mime_type(&jpeg));
-        assert!(rank_mime_type(&jpeg) > rank_mime_type(&markdown));
-        assert!(rank_mime_type(&markdown) > rank_mime_type(&plain));
+        assert!(rank_mime_type(&png) > rank_mime_type(&html));
+        assert!(rank_mime_type(&jpeg) > rank_mime_type(&html));
+        assert!(rank_mime_type(&html) > rank_mime_type(&latex));
+        assert!(rank_mime_type(&latex) > rank_mime_type(&markdown));
+        assert!(rank_mime_type(&markdown) > rank_mime_type(&json));
+        assert!(rank_mime_type(&json) > rank_mime_type(&plain));
     }
 
     #[test]
     fn test_rank_mime_type_unsupported_returns_zero() {
         let svg = MimeType::Svg(String::new());
-        let latex = MimeType::Latex(String::new());
+        let widget = MimeType::WidgetView(serde_json::json!({}));
 
         assert_eq!(rank_mime_type(&svg), 0);
-        assert_eq!(rank_mime_type(&latex), 0);
+        assert_eq!(rank_mime_type(&widget), 0);
     }
 
     async fn init_test(
@@ -975,6 +1152,118 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_push_message_stream_keeps_stdout_and_stderr_separate(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, workspace) = init_test(cx).await;
+        let execution_view = create_execution_view(&mut cx, workspace);
+
+        cx.update(|window, cx| {
+            execution_view.update(cx, |view, cx| {
+                view.push_message(
+                    &JupyterMessageContent::StreamContent(StreamContent {
+                        name: Stdio::Stdout,
+                        text: "out".to_string(),
+                    }),
+                    window,
+                    cx,
+                );
+                view.push_message(
+                    &JupyterMessageContent::StreamContent(StreamContent {
+                        name: Stdio::Stderr,
+                        text: "err".to_string(),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|_, cx| {
+            let view = execution_view.read(cx);
+            assert_eq!(
+                view.outputs.len(),
+                2,
+                "streams with different names must not be merged"
+            );
+
+            let serialized: Vec<serde_json::Value> = view
+                .outputs
+                .iter()
+                .filter_map(|output| output.to_nbformat(cx))
+                .map(|output| serde_json::to_value(output).expect("serializable"))
+                .collect();
+
+            assert_eq!(serialized[0]["name"], "stdout");
+            assert_eq!(serialized[0]["text"], serde_json::json!(["out"]));
+            assert_eq!(serialized[1]["name"], "stderr");
+            assert_eq!(serialized[1]["text"], serde_json::json!(["err"]));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_widget_output_shows_placeholder_and_preserves_bundle(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, workspace) = init_test(cx).await;
+        let execution_view = create_execution_view(&mut cx, workspace);
+
+        let widget_bundle = serde_json::json!({
+            "application/vnd.jupyter.widget-view+json": {
+                "model_id": "abc",
+                "version_major": 2,
+                "version_minor": 0
+            },
+            "text/plain": "HBox(children=(...))"
+        });
+
+        cx.update(|window, cx| {
+            execution_view.update(cx, |view, cx| {
+                let data: MimeBundle =
+                    serde_json::from_value(widget_bundle.clone()).expect("valid media bundle");
+                view.push_message(
+                    &JupyterMessageContent::DisplayData(runtimelib::DisplayData {
+                        data,
+                        metadata: serde_json::Map::new(),
+                        transient: None,
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|_, cx| {
+            let view = execution_view.read(cx);
+            match &view.outputs[0] {
+                Output::Message { text, .. } => {
+                    assert!(text.contains("não suportada"), "placeholder text: {text}");
+                    assert!(text.contains("HBox(children=(...))"), "alt text: {text}");
+                }
+                other => panic!(
+                    "expected a placeholder Message, got {:?}",
+                    std::mem::discriminant(other)
+                ),
+            }
+
+            let serialized = serde_json::to_value(
+                view.outputs[0]
+                    .to_nbformat(cx)
+                    .expect("widget output must be preserved"),
+            )
+            .expect("serializable");
+            assert_eq!(
+                serialized["data"]["application/vnd.jupyter.widget-view+json"],
+                widget_bundle["application/vnd.jupyter.widget-view+json"]
+            );
+            assert_eq!(
+                serialized["data"]["text/plain"],
+                serde_json::json!(["HBox(children=(...))"])
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_push_message_error_output(cx: &mut TestAppContext) {
         let (mut cx, workspace) = init_test(cx).await;
         let execution_view = create_execution_view(&mut cx, workspace);
@@ -997,9 +1286,9 @@ mod tests {
             let view = execution_view.read(cx);
             assert_eq!(view.outputs.len(), 1);
             match &view.outputs[0] {
-                Output::ErrorOutput(error_view) => {
-                    assert_eq!(error_view.ename, "NameError");
-                    assert_eq!(error_view.evalue, "name 'x' is not defined");
+                Output::ErrorOutput { content, .. } => {
+                    assert_eq!(content.ename, "NameError");
+                    assert_eq!(content.evalue, "name 'x' is not defined");
                 }
                 other => panic!(
                     "expected ErrorOutput, got {:?}",

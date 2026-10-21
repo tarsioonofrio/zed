@@ -5,7 +5,7 @@ pub use pulldown_cmark::TagEnd as MarkdownTagEnd;
 use pulldown_cmark::{
     Alignment, CowStr, HeadingLevel, LinkType, MetadataBlockKind, Options, Parser,
 };
-use std::{ops::Range, sync::Arc};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 use util::markdown::generate_heading_slug;
 
 use crate::{html, path_range::PathWithRange};
@@ -279,6 +279,94 @@ pub(crate) fn parse_markdown_with_options(
     parse_heading_slugs: bool,
     parse_metadata_blocks: bool,
 ) -> ParsedMarkdownData {
+    parse_markdown_with_math(
+        text,
+        parse_html,
+        parse_heading_slugs,
+        parse_metadata_blocks,
+        false,
+    )
+}
+
+/// Rewrites a math block's standalone `$` delimiter lines into `$$` delimiters so
+/// pulldown-cmark recognizes them, and masks lines that would otherwise become
+/// Setext heading underlines. The rewrite keeps every byte in place (replacing the
+/// adjacent newline or underline character), so the byte ranges reported by the
+/// parser stay valid against the original source.
+fn preprocess_math_source(source: &str) -> String {
+    let mut bytes = source.as_bytes().to_vec();
+    let length = bytes.len();
+    let mut in_math = false;
+    let mut line_start = 0;
+
+    loop {
+        let line_end = source[line_start..]
+            .find('\n')
+            .map_or(length, |offset| line_start + offset);
+        let line = &source[line_start..line_end];
+        let leading_whitespace = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let trimmed = line.trim_matches([' ', '\t']);
+
+        if trimmed == "$" {
+            // Make the lone `$` adjacent to another `$` so pulldown-cmark treats
+            // it as a delimiter. Replacing the character before the `$` keeps the
+            // delimiter on its own line and preserves every byte offset.
+            let dollar = line_start + leading_whitespace;
+            if dollar > 0 {
+                bytes[dollar - 1] = b'$';
+            } else if dollar + 1 < length {
+                bytes[dollar + 1] = b'$';
+            }
+            in_math = !in_math;
+        } else if in_math
+            && !trimmed.is_empty()
+            && (trimmed.bytes().all(|byte| byte == b'=')
+                || trimmed.bytes().all(|byte| byte == b'-'))
+        {
+            // Replace a bare `=`/`-` line with a neutral character so that it is
+            // not mistaken for a Setext heading underline.
+            let content_start = line_start + leading_whitespace;
+            for byte in &mut bytes[content_start..content_start + trimmed.len()] {
+                *byte = b'.';
+            }
+        }
+
+        if line_end >= length {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+
+    let Ok(transformed) = String::from_utf8(bytes) else {
+        return source.to_string();
+    };
+    transformed
+}
+
+/// Returns the LaTeX between the math delimiters, slicing the original source so
+/// that any characters masked for parsing purposes are preserved.
+fn math_delimited_content(source: &str, range: Range<usize>, display: bool) -> SharedString {
+    let delimiter_length = if display { 2 } else { 1 };
+    let start = range.start + delimiter_length;
+    let end = range.end.saturating_sub(delimiter_length);
+    if start <= end
+        && end <= source.len()
+        && source.is_char_boundary(start)
+        && source.is_char_boundary(end)
+    {
+        SharedString::from(source[start..end].trim().to_string())
+    } else {
+        SharedString::from("")
+    }
+}
+
+pub(crate) fn parse_markdown_with_math(
+    text: &str,
+    parse_html: bool,
+    parse_heading_slugs: bool,
+    parse_metadata_blocks: bool,
+    parse_math: bool,
+) -> ParsedMarkdownData {
     let mut state = ParseState::default();
     let mut language_names = HashSet::default();
     let mut language_paths = HashSet::default();
@@ -311,7 +399,17 @@ pub(crate) fn parse_markdown_with_options(
         }
     }
     let body_start = frontmatter.last().map_or(0, |(_, range)| range.end);
-    let parser = Parser::new_ext(&text[body_start..], PARSE_OPTIONS);
+    let body_options = if parse_math {
+        PARSE_OPTIONS.union(Options::ENABLE_MATH)
+    } else {
+        PARSE_OPTIONS
+    };
+    let parse_source = if parse_math {
+        Cow::Owned(preprocess_math_source(&text[body_start..]))
+    } else {
+        Cow::Borrowed(&text[body_start..])
+    };
+    let parser = Parser::new_ext(&parse_source, body_options);
     let mut link_definition_spans = parser
         .reference_definitions()
         .iter()
@@ -731,7 +829,14 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::TaskListMarker(checked) => {
                 state.push_event(range, MarkdownEvent::TaskListMarker(checked))
             }
-            pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
+            pulldown_cmark::Event::InlineMath(_) => {
+                let content = math_delimited_content(text, range.clone(), false);
+                state.push_event(range, MarkdownEvent::InlineMath(content));
+            }
+            pulldown_cmark::Event::DisplayMath(_) => {
+                let content = math_delimited_content(text, range.clone(), true);
+                state.push_event(range, MarkdownEvent::DisplayMath(content));
+            }
         }
     }
 
@@ -838,6 +943,10 @@ pub enum MarkdownEvent {
     Code,
     /// An inline code node that differs from the markdown source due to escape decoding.
     SubstitutedCode(String),
+    /// Inline math (`$...$`). Contains the LaTeX source between the delimiters.
+    InlineMath(SharedString),
+    /// Display math (`$$...$$`). Contains the LaTeX source between the delimiters.
+    DisplayMath(SharedString),
     /// An HTML node.
     Html,
     /// An inline HTML node.
@@ -1044,9 +1153,9 @@ mod tests {
     use super::MarkdownTag::*;
     use super::*;
 
-    const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
-        .union(Options::ENABLE_DEFINITION_LIST)
+    const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        .union(Options::ENABLE_MATH);
+    const UNWANTED_OPTIONS: Options = Options::ENABLE_DEFINITION_LIST
         .union(Options::ENABLE_WIKILINKS);
 
     #[test]
@@ -2083,5 +2192,116 @@ mod tests {
                 "unrecognized inline HTML \"{input}\" should not emit HardBreak"
             );
         }
+    }
+
+    #[test]
+    fn test_math_events_only_when_enabled() {
+        let source = "$a$ and $$b$$";
+
+        let enabled = parse_markdown_with_math(source, false, false, false, true);
+        assert!(
+            enabled
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, InlineMath(_)))
+        );
+        assert!(
+            enabled
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, DisplayMath(_)))
+        );
+
+        let disabled = parse_markdown_with_options(source, false, false, false);
+        assert!(
+            !disabled.events.iter().any(|(_, event)| matches!(
+                event,
+                InlineMath(_) | DisplayMath(_)
+            )),
+            "math events must not be emitted when parsing math is disabled"
+        );
+    }
+
+    fn display_math_contents(source: &str) -> Vec<String> {
+        parse_markdown_with_math(source, false, false, false, true)
+            .events
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                DisplayMath(content) => Some(content.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_standalone_dollar_delimiters_form_display_math() {
+        let source = "Intro\n\n$\n\\mathrm{Attention}(Q,K,V)\n=\n\\mathrm{softmax}\\left(\\frac{QK^T}{\\sqrt{d_k}}\\right)V\n$\n\nOutro\n";
+        let parsed = parse_markdown_with_math(source, false, false, false, true);
+
+        let display = parsed
+            .events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                DisplayMath(content) => Some(content.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            display,
+            vec![
+                "\\mathrm{Attention}(Q,K,V)\n=\n\\mathrm{softmax}\\left(\\frac{QK^T}{\\sqrt{d_k}}\\right)V"
+                    .to_string()
+            ]
+        );
+        assert!(
+            !parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, Start(Heading { .. }))),
+            "a lone `=` line inside math must not become a Setext heading"
+        );
+        for (range, _) in &parsed.events {
+            assert!(source.get(range.clone()).is_some(), "{range:?} out of bounds");
+        }
+    }
+
+    #[test]
+    fn test_standalone_dollar_delimiters_inside_list_item() {
+        let source = "1. before\n\n   $\n   Z_i=\\sum_j e^{x_{ij}-m_i}v_j\n   $\n\n2. after\n";
+        assert_eq!(
+            display_math_contents(source),
+            vec!["Z_i=\\sum_j e^{x_{ij}-m_i}v_j".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_standalone_dollar_delimiters_require_math_enabled() {
+        let source = "$\na\n=\nb\n$\n";
+        assert_eq!(
+            display_math_contents(source),
+            vec!["a\n=\nb".to_string()]
+        );
+
+        let disabled = parse_markdown_with_math(source, false, false, false, false);
+        assert!(
+            !disabled
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, InlineMath(_) | DisplayMath(_))),
+            "standalone `$` must remain plain text when math is disabled"
+        );
+    }
+
+    #[test]
+    fn test_currency_dollars_are_not_display_math() {
+        let source = "custa $5 e $10 hoje\n";
+        let parsed = parse_markdown_with_math(source, false, false, false, true);
+        assert!(
+            !parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, InlineMath(_) | DisplayMath(_))),
+            "currency amounts must not be parsed as math"
+        );
     }
 }

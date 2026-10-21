@@ -3,9 +3,10 @@ use crate::{
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    NotebookDeleteCellTool, NotebookEditCellTool, NotebookInsertCellTool, NotebookMoveCellTool,
+    NotebookReadTool, ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool,
+    SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
 use action_log::ActionLog;
@@ -426,6 +427,21 @@ impl UserMessage {
                         }
                         MentionUri::Thread { .. } => {
                             write!(&mut thread_context, "\n{}\n", content).ok();
+                        }
+                        MentionUri::NotebookCell {
+                            abs_path,
+                            line_range,
+                            ..
+                        } => {
+                            write!(
+                                &mut selection_context,
+                                "\n{}",
+                                MarkdownCodeBlock {
+                                    tag: &codeblock_tag(abs_path, line_range.as_ref()),
+                                    text: content
+                                }
+                            )
+                            .ok();
                         }
                         MentionUri::Rule { .. } => {
                             // Deprecated: keeps legacy rule mentions as context.
@@ -1082,6 +1098,10 @@ impl ToolPermissionContext {
                 || tool_name == WriteFileTool::NAME
                 || tool_name == DeletePathTool::NAME
                 || tool_name == CreateDirectoryTool::NAME
+                || tool_name == NotebookEditCellTool::NAME
+                || tool_name == NotebookInsertCellTool::NAME
+                || tool_name == NotebookDeleteCellTool::NAME
+                || tool_name == NotebookMoveCellTool::NAME
             {
                 (
                     extract_path_pattern(value),
@@ -2240,6 +2260,23 @@ impl Thread {
         self.add_tool(GrepTool::new(self.project.clone()));
         self.add_tool(ListDirectoryTool::new(self.project.clone()));
         self.add_tool(MovePathTool::new(self.project.clone()));
+        self.add_tool(NotebookReadTool::new(self.project.clone()));
+        self.add_tool(NotebookEditCellTool::new(
+            self.project.clone(),
+            cx.weak_entity(),
+        ));
+        self.add_tool(NotebookInsertCellTool::new(
+            self.project.clone(),
+            cx.weak_entity(),
+        ));
+        self.add_tool(NotebookDeleteCellTool::new(
+            self.project.clone(),
+            cx.weak_entity(),
+        ));
+        self.add_tool(NotebookMoveCellTool::new(
+            self.project.clone(),
+            cx.weak_entity(),
+        ));
         self.add_tool(ReadFileTool::new(
             self.project.clone(),
             self.action_log.clone(),

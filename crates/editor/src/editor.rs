@@ -1610,6 +1610,15 @@ pub struct RenameTarget {
     language_server_id: Option<LanguageServerId>,
 }
 
+impl RenameTarget {
+    pub fn new(range: Range<text::Anchor>, language_server_id: Option<LanguageServerId>) -> Self {
+        Self {
+            range,
+            language_server_id,
+        }
+    }
+}
+
 #[doc(hidden)]
 pub struct RenameState {
     pub range: Range<Anchor>,
@@ -3103,6 +3112,21 @@ impl Editor {
         self.workspace.as_ref()?.0.upgrade()
     }
 
+    /// Points this editor at a workspace without making it a workspace item.
+    ///
+    /// Editors hosted inside another item (such as notebook cells) are not added
+    /// to the pane themselves, so they would otherwise have no workspace to open
+    /// references, apply code actions or report errors in. Only the navigation
+    /// and notification paths need it; the editor is still not serialized or
+    /// saved as a pane item.
+    pub fn set_workspace(
+        &mut self,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: Option<WorkspaceId>,
+    ) {
+        self.workspace = Some((workspace, workspace_id));
+    }
+
     /// Detaches a task and shows an error notification in the workspace if available,
     /// otherwise just logs the error.
     pub fn detach_and_notify_err<R, E>(
@@ -3304,6 +3328,14 @@ impl Editor {
 
     pub fn set_semantics_provider(&mut self, provider: Option<Rc<dyn SemanticsProvider>>) {
         self.semantics_provider = provider;
+    }
+
+    pub fn add_code_action_provider(&mut self, provider: Rc<dyn CodeActionProvider>) {
+        self.code_action_providers.push(provider);
+    }
+
+    pub fn code_action_providers(&self) -> &[Rc<dyn CodeActionProvider>] {
+        &self.code_action_providers
     }
 
     pub fn placeholder_text(&self, cx: &mut App) -> Option<String> {
@@ -8357,7 +8389,7 @@ impl Editor {
             return Some(Task::ready(Ok(())));
         }
 
-        let workspace = self.workspace()?.downgrade();
+        let workspace = self.workspace().map(|workspace| workspace.downgrade());
         let (buffer, start) = self
             .buffer
             .read(cx)
@@ -8382,14 +8414,17 @@ impl Editor {
 
         Some(cx.spawn_in(window, async move |editor, cx| {
             let project_transaction = rename.await?;
-            Self::open_project_transaction(
-                &editor,
-                workspace,
-                project_transaction,
-                format!("Rename: {} → {}", old_name, new_name),
-                cx,
-            )
-            .await?;
+            // Editors without a workspace (notebook cells) apply the rename in place.
+            if let Some(workspace) = workspace {
+                Self::open_project_transaction(
+                    &editor,
+                    workspace,
+                    project_transaction,
+                    format!("Rename: {} → {}", old_name, new_name),
+                    cx,
+                )
+                .await?;
+            }
 
             editor.update(cx, |editor, cx| {
                 editor.refresh_document_highlights(cx);
@@ -8564,6 +8599,21 @@ impl Editor {
 
         buffers.retain(|buffer| !buffer.read(cx).read_only());
 
+        let semantics_format = self.semantics_provider.as_ref().and_then(|provider| {
+            let mut cell_buffers = buffers.iter();
+            let buffer = cell_buffers.next()?;
+            if cell_buffers.next().is_some() {
+                return None;
+            }
+            let ranges = match &target {
+                LspFormatTarget::Buffers => None,
+                LspFormatTarget::Ranges(ranges) => {
+                    Some(ranges.get(&buffer.read(cx).remote_id())?.clone())
+                }
+            };
+            provider.format(buffer, ranges, trigger, cx)
+        });
+
         let transaction_id_prev = buffer.read(cx).last_transaction_id(cx);
         let (selections_prev, add_selections_state_prev) = transaction_id_prev
             .and_then(|transaction_id_prev| {
@@ -8588,9 +8638,12 @@ impl Editor {
             });
 
         let mut timeout = cx.background_executor().timer(FORMAT_TIMEOUT).fuse();
-        let format = project.update(cx, |project, cx| {
-            project.format(buffers, target, true, trigger, cx)
-        });
+        let format = match semantics_format {
+            Some(format) => format,
+            None => project.update(cx, |project, cx| {
+                project.format(buffers, target, true, trigger, cx)
+            }),
+        };
 
         cx.spawn_in(window, async move |editor, cx| {
             let transaction = futures::select_biased! {
@@ -11928,6 +11981,21 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<LocationLink>>>>>;
 
+    /// Finds all references to the symbol at `position`.
+    ///
+    /// When this returns `None` the editor asks the project directly using the
+    /// buffer it was given. A provider that owns a buffer the project cannot see
+    /// (such as a notebook cell mirrored into a virtual document) resolves the
+    /// references itself and translates the results back into visible buffers.
+    fn references(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: text::Anchor,
+        _cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<Location>>>>> {
+        None
+    }
+
     fn range_for_rename(
         &self,
         buffer: &Entity<Buffer>,
@@ -11943,6 +12011,20 @@ pub trait SemanticsProvider {
         language_server_id: Option<LanguageServerId>,
         cx: &mut App,
     ) -> Option<Task<Result<ProjectTransaction>>>;
+
+    /// Formats `buffer`, restricted to `ranges` when they are supplied. When
+    /// this returns `None` the editor falls back to the project, which is what
+    /// happens for ordinary buffers; a provider that owns a buffer the project
+    /// cannot see (such as a notebook cell) formats it itself.
+    fn format(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _ranges: Option<Vec<Range<text::Anchor>>>,
+        _trigger: FormatTrigger,
+        _cx: &mut App,
+    ) -> Option<Task<Result<ProjectTransaction>>> {
+        None
+    }
 }
 
 impl SemanticsProvider for WeakEntity<Project> {
@@ -11994,6 +12076,16 @@ impl SemanticsProvider for WeakEntity<Project> {
             GotoDefinitionKind::Implementation => project.implementations(buffer, position, cx),
         })
         .ok()
+    }
+
+    fn references(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<Location>>>>> {
+        self.update(cx, |project, cx| project.references(buffer, position, cx))
+            .ok()
     }
 
     fn supports_inlay_hints(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {

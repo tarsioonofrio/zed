@@ -1035,6 +1035,68 @@ pub struct JupyterContent {
     ///
     /// Default: `{}`
     pub kernel_selections: Option<HashMap<String, String>>,
+
+    /// Which numbers to show in the gutter of notebook cells.
+    ///
+    /// Default: both
+    pub notebook_cell_numbers: Option<NotebookCellNumbersContent>,
+
+    /// Where to show the notebook variables panel.
+    ///
+    /// Default: right
+    pub notebook_variables_panel: Option<NotebookVariablesPanelContent>,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NotebookVariablesPanelContent {
+    /// Show the variables panel to the right of the notebook.
+    #[default]
+    Right,
+    /// Show the variables panel below the notebook.
+    Bottom,
+    /// Hide the variables panel.
+    Hidden,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NotebookCellNumbersContent {
+    /// Show the cell position and, for code cells, the execution count.
+    #[default]
+    Both,
+    /// Show only the cell position.
+    Position,
+    /// Show only the execution count of code cells.
+    ExecutionCount,
+    /// Show no numbers.
+    None,
 }
 
 /// Whether to allow drag and drop text selection in buffer.

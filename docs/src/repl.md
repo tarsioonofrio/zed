@@ -179,6 +179,45 @@ To configure a different default kernel for a language, you can assign a kernel 
 }
 ```
 
+### Notebook Cell Numbers
+
+Notebook cells show their position in the gutter. Code cells also show their Jupyter execution count. Control this with `jupyter.notebook_cell_numbers`:
+
+```json [settings]
+{
+  "jupyter": {
+    "notebook_cell_numbers": "both"
+  }
+}
+```
+
+The available values are:
+
+- `"both"` (default): cell position and execution count.
+- `"position"`: only the cell position.
+- `"execution_count"`: only the execution count of code cells.
+- `"none"`: no cell numbers.
+
+### Notebook Variables Panel
+
+The variables panel shows the user variables defined in a Python kernel. Configure where it appears with `jupyter.notebook_variables_panel`:
+
+```json [settings]
+{
+  "jupyter": {
+    "notebook_variables_panel": "right"
+  }
+}
+```
+
+The available values are:
+
+- `"right"` (default): show the panel to the right of the notebook. Variables are stacked with the name, type, and value on separate lines. Drag the divider on the panel's left edge to resize it.
+- `"bottom"`: show the panel below the notebook as one row per variable with aligned Name, Type, and Value columns. Drag the divider above the panel to resize it.
+- `"hidden"`: hide the panel.
+
+You can also toggle the panel from the notebook toolbar, or move it between the right side and the bottom from the toolbar's more options menu. Changes made this way apply to the open notebook session.
+
 ## Interactive Input
 
 When code execution requires user input (such as Python's `input()` function), the REPL displays an input prompt below the cell output.

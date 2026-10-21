@@ -1,5 +1,5 @@
 use crate::diagnostics::{DiagnosticsOptions, codeblock_fence_for_path, collect_diagnostics};
-use acp_thread::{MentionUri, selection_name};
+use acp_thread::MentionUri;
 use agent::{ThreadStore, outline};
 use agent_client_protocol::schema::v2 as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
@@ -164,6 +164,11 @@ impl MentionSet {
             MentionUri::Selection { abs_path: None, .. } => Task::ready(Err(anyhow!(
                 "Untitled buffer selection mentions are not supported for paste"
             ))),
+            MentionUri::NotebookCell {
+                abs_path,
+                cell_number,
+                line_range,
+            } => self.confirm_mention_for_notebook_cell(abs_path, cell_number, line_range, cx),
             MentionUri::PastedImage { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::MergeConflict { .. }
@@ -337,6 +342,10 @@ impl MentionSet {
                 debug_panic!("unexpected selection URI");
                 Task::ready(Err(anyhow!("unexpected selection URI")))
             }
+            MentionUri::NotebookCell { .. } => {
+                debug_panic!("unexpected notebook cell URI");
+                Task::ready(Err(anyhow!("unexpected notebook cell URI")))
+            }
             MentionUri::TerminalSelection { .. } => {
                 debug_panic!("unexpected terminal URI");
                 Task::ready(Err(anyhow!("unexpected terminal URI")))
@@ -492,6 +501,41 @@ impl MentionSet {
         })
     }
 
+    fn confirm_mention_for_notebook_cell(
+        &self,
+        abs_path: PathBuf,
+        cell_number: usize,
+        line_range: Option<RangeInclusive<u32>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Mention>> {
+        cx.background_spawn(async move {
+            let contents = std::fs::read_to_string(&abs_path).map_err(|error| {
+                anyhow!(
+                    "Failed to read notebook {}: {}",
+                    abs_path.display(),
+                    error
+                )
+            })?;
+            let notebook: serde_json::Value = serde_json::from_str(&contents)?;
+            let source = notebook
+                .get("cells")
+                .and_then(|cells| cells.as_array())
+                .and_then(|cells| cells.get(cell_number.saturating_sub(1)))
+                .and_then(|cell| cell.get("source"))
+                .with_context(|| {
+                    format!(
+                        "Notebook cell {cell_number} not found in {}",
+                        abs_path.display()
+                    )
+                })?;
+            let text = notebook_cell_source_to_string(source)?;
+            Ok(Mention::Text {
+                content: apply_cell_line_range(&text, line_range.as_ref()),
+                tracked_buffers: Vec::new(),
+            })
+        })
+    }
+
     fn confirm_mention_for_skill(
         &self,
         skill_file_path: PathBuf,
@@ -556,13 +600,24 @@ impl MentionSet {
             let point_range = selection_range.to_point(&snapshot);
             let line_range = point_range.start.row..=point_range.end.row;
 
-            let uri = MentionUri::Selection {
-                abs_path: abs_path.clone(),
-                line_range: line_range.clone(),
-                column: None,
+            let uri = match notebook_cell_context::lookup(cx, buffer.read(cx).remote_id()) {
+                Some(reference) => {
+                    let is_whole_cell =
+                        *line_range.start() == 0 && *line_range.end() == snapshot.max_point().row;
+                    MentionUri::NotebookCell {
+                        abs_path: reference.notebook_path,
+                        cell_number: reference.cell_number,
+                        line_range: (!is_whole_cell).then(|| line_range.clone()),
+                    }
+                }
+                None => MentionUri::Selection {
+                    abs_path: abs_path.clone(),
+                    line_range: line_range.clone(),
+                    column: None,
+                },
             };
             let crease = crease_for_mention(
-                selection_name(abs_path.as_deref(), &line_range).into(),
+                uri.name().into(),
                 uri.icon_path(cx),
                 uri.tooltip_text(),
                 Some(uri.clone()),
@@ -1324,6 +1379,43 @@ fn full_mention_for_directory(
             .await;
         anyhow::Ok(contents)
     })
+}
+
+/// Reads an nbformat `source` field, which is either a single string or an
+/// array of line strings, into one string.
+fn notebook_cell_source_to_string(source: &serde_json::Value) -> Result<String> {
+    match source {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        serde_json::Value::Array(lines) => {
+            let mut text = String::new();
+            for line in lines {
+                text.push_str(
+                    line.as_str()
+                        .context("notebook cell source line is not a string")?,
+                );
+            }
+            Ok(text)
+        }
+        _ => Err(anyhow!("unexpected notebook cell source")),
+    }
+}
+
+/// Applies a cell-relative, 0-based line range to a cell's source. A `None`
+/// range returns the whole cell.
+fn apply_cell_line_range(text: &str, line_range: Option<&RangeInclusive<u32>>) -> String {
+    let Some(line_range) = line_range else {
+        return text.to_string();
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .skip(*line_range.start() as usize)
+        .take((*line_range.end() - *line_range.start() + 1) as usize)
+        .collect();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
 }
 
 fn render_directory_contents(entries: Vec<(Arc<RelPath>, String, String)>) -> String {

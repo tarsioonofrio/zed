@@ -33,7 +33,7 @@ fn refresh_python_kernelspecs_for_buffer(
     let store = ReplStore::global(cx);
     store.update(cx, |store, cx| {
         store
-            .refresh_python_kernelspecs(project_path.worktree_id, project, cx)
+            .refresh_python_kernelspecs(project_path, project, cx)
             .detach_and_log_err(cx);
     });
 }

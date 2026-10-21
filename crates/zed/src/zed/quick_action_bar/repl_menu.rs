@@ -2,6 +2,7 @@ use gpui::ElementId;
 use gpui::TaskExt;
 use gpui::{AnyElement, Entity};
 use picker::Picker;
+use project::ProjectPath;
 use repl::{
     ExecutionState, JupyterSettings, Kernel, KernelSpecification, KernelStatus, Session,
     SessionSupport,
@@ -13,6 +14,7 @@ use ui::{
     PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*,
 };
 use util::ResultExt;
+use util::rel_path::RelPath;
 
 use super::QuickActionBar;
 
@@ -296,7 +298,14 @@ impl QuickActionBar {
             {
                 store
                     .update(cx, |store, cx| {
-                        store.refresh_python_kernelspecs(worktree_id, &project, cx)
+                        store.refresh_python_kernelspecs(
+                            ProjectPath {
+                                worktree_id,
+                                path: RelPath::empty_arc(),
+                            },
+                            &project,
+                            cx,
+                        )
                     })
                     .detach_and_log_err(cx);
             }

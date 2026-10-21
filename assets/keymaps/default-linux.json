@@ -1620,6 +1620,13 @@
     },
   },
   {
+    "context": "NotebookEditor > Editor && mode == single_line",
+    "bindings": {
+      "enter": "editor::ConfirmRename",
+      "escape": "editor::Cancel",
+    },
+  },
+  {
     "context": "GitBranchSelector || (GitBranchSelector > Picker > Editor)",
     "use_key_equivalents": true,
     "bindings": {

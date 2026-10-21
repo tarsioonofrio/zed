@@ -1008,7 +1008,13 @@ impl KernelSession for Session {
 
                 self.blocks.iter_mut().for_each(|(_, block)| {
                     block.execution_view.update(cx, |execution_view, cx| {
-                        execution_view.update_display_data(&update.data, &display_id, window, cx);
+                        execution_view.update_display_data(
+                            &update.data,
+                            &update.metadata,
+                            &display_id,
+                            window,
+                            cx,
+                        );
                     });
                 });
                 return;

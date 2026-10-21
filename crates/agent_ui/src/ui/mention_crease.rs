@@ -195,6 +195,9 @@ fn open_mention_uri(
         MentionUri::Directory { abs_path } => {
             reveal_in_project_panel(workspace, abs_path, cx);
         }
+        MentionUri::NotebookCell { abs_path, .. } => {
+            open_abs_path_at_point(workspace, abs_path, None, window, cx);
+        }
         MentionUri::Thread { id, name } => {
             open_thread(workspace, id, name, window, cx);
         }

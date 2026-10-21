@@ -1,5 +1,5 @@
 mod native_kernel;
-use std::{fmt::Debug, future::Future, path::PathBuf};
+use std::{fmt::Debug, future::Future, path::PathBuf, sync::Arc};
 
 use futures::{channel::mpsc, future::Shared};
 use gpui::{App, Entity, Task, Window};
@@ -405,9 +405,107 @@ fn extract_environment_kind(toolchain_json: &serde_json::Value) -> Option<String
     Some(label.to_string())
 }
 
+/// Builds the kernel specification for a Python interpreter discovered on
+/// disk, following the same conventions as toolchain-backed environments
+/// (argv, display name, and the `PATH`/`VIRTUAL_ENV` variables the kernel
+/// inherits).
+pub(crate) fn python_environment_kernel_specification(
+    name: String,
+    python_path: PathBuf,
+    environment_kind: Option<String>,
+    has_ipykernel: bool,
+) -> PythonEnvKernelSpecification {
+    let mut env = HashMap::new();
+    if let Some(python_bin_dir) = python_path.parent() {
+        if let Some(path_var) = std::env::var_os("PATH") {
+            let mut paths = std::env::split_paths(&path_var).collect::<Vec<_>>();
+            paths.insert(0, python_bin_dir.to_path_buf());
+            if let Ok(new_path) = std::env::join_paths(paths) {
+                env.insert("PATH".to_string(), new_path.to_string_lossy().to_string());
+            }
+        }
+
+        if let Some(venv_root) = python_bin_dir.parent() {
+            env.insert(
+                "VIRTUAL_ENV".to_string(),
+                venv_root.to_string_lossy().to_string(),
+            );
+        }
+    }
+
+    let python_path_string = python_path.to_string_lossy().into_owned();
+    let kernelspec = JupyterKernelspec {
+        argv: vec![
+            python_path_string,
+            "-m".to_string(),
+            "ipykernel_launcher".to_string(),
+            "-f".to_string(),
+            "{connection_file}".to_string(),
+        ],
+        display_name: name.clone(),
+        language: "python".to_string(),
+        interrupt_mode: None,
+        metadata: None,
+        env: Some(env),
+    };
+
+    PythonEnvKernelSpecification {
+        name,
+        path: python_path,
+        kernelspec,
+        has_ipykernel,
+        environment_kind,
+    }
+}
+
+/// Probes a virtual environment interpreter for `ipykernel` and builds its
+/// kernel specification. The caller decides which interpreter is closest to
+/// the notebook; this only makes the specification usable by the kernel picker.
+pub(crate) async fn probe_python_environment_interpreter(
+    interpreter: PathBuf,
+    environment_kind: Option<String>,
+) -> PythonEnvKernelSpecification {
+    let interpreter_string = interpreter.to_string_lossy().into_owned();
+    // The version is printed before the import so it is still reported when
+    // `ipykernel` is missing and the command exits with an error.
+    let probe = util::command::new_command(&interpreter_string)
+        .args([
+            "-c",
+            "import sys; print('.'.join(map(str, sys.version_info[:3]))); import ipykernel",
+        ])
+        .output()
+        .await
+        .ok();
+    let has_ipykernel = probe
+        .as_ref()
+        .is_some_and(|output| output.status.success());
+    let version = probe.and_then(|output| {
+        String::from_utf8(output.stdout)
+            .ok()?
+            .lines()
+            .next()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+    });
+
+    let environment_label = match (version, environment_kind.as_deref()) {
+        (Some(version), Some(kind)) => format!("Python {version} ({kind})"),
+        (Some(version), None) => format!("Python {version}"),
+        (None, Some(kind)) => format!("Python ({kind})"),
+        (None, None) => "Python".to_string(),
+    };
+    python_environment_kernel_specification(
+        environment_label,
+        interpreter,
+        environment_kind,
+        has_ipykernel,
+    )
+}
+
 pub fn python_env_kernel_specifications(
     project: &Entity<Project>,
     worktree_id: WorktreeId,
+    relative_path: Arc<RelPath>,
     cx: &mut App,
 ) -> impl Future<Output = Result<Vec<KernelSpecification>>> + use<> {
     let python_language = LanguageName::new_static("Python");
@@ -426,7 +524,7 @@ pub fn python_env_kernel_specifications(
     let toolchains = project.read(cx).available_toolchains(
         ProjectPath {
             worktree_id,
-            path: RelPath::empty_arc(),
+            path: relative_path,
         },
         python_language,
         cx,
@@ -514,54 +612,35 @@ pub fn python_env_kernel_specifications(
                         .map(|output| output.status.success())
                         .unwrap_or(false);
 
-                    let mut env = HashMap::new();
-                    if let Some(python_bin_dir) = PathBuf::from(&python_path).parent() {
-                        if let Some(path_var) = std::env::var_os("PATH") {
-                            let mut paths = std::env::split_paths(&path_var).collect::<Vec<_>>();
-                            paths.insert(0, python_bin_dir.to_path_buf());
-                            if let Ok(new_path) = std::env::join_paths(paths) {
-                                env.insert("PATH".to_string(), new_path.to_string_lossy().to_string());
-                            }
-                        }
-
-                        if let Some(venv_root) = python_bin_dir.parent() {
-                            env.insert("VIRTUAL_ENV".to_string(), venv_root.to_string_lossy().to_string());
-                        }
-                    }
+                    let specification = python_environment_kernel_specification(
+                        toolchain.name.to_string(),
+                        PathBuf::from(&python_path),
+                        environment_kind,
+                        has_ipykernel,
+                    );
 
                     log::info!("Preparing Python kernel for toolchain: {}", toolchain.name);
                     log::info!("Python path: {}", python_path);
-                    if let Some(path) = env.get("PATH") {
-                         log::info!("Kernel PATH: {}", path);
+                    if let Some(path) = specification
+                        .kernelspec
+                        .env
+                        .as_ref()
+                        .and_then(|env| env.get("PATH"))
+                    {
+                        log::info!("Kernel PATH: {}", path);
                     } else {
-                         log::info!("Kernel PATH not set in env");
+                        log::info!("Kernel PATH not set in env");
                     }
-                    if let Some(venv) = env.get("VIRTUAL_ENV") {
-                         log::info!("Kernel VIRTUAL_ENV: {}", venv);
+                    if let Some(venv) = specification
+                        .kernelspec
+                        .env
+                        .as_ref()
+                        .and_then(|env| env.get("VIRTUAL_ENV"))
+                    {
+                        log::info!("Kernel VIRTUAL_ENV: {}", venv);
                     }
 
-                    let kernelspec = JupyterKernelspec {
-                        argv: vec![
-                            python_path.clone(),
-                            "-m".to_string(),
-                            "ipykernel_launcher".to_string(),
-                            "-f".to_string(),
-                            "{connection_file}".to_string(),
-                        ],
-                        display_name: toolchain.name.to_string(),
-                        language: "python".to_string(),
-                        interrupt_mode: None,
-                        metadata: None,
-                        env: Some(env),
-                    };
-
-                    Some(KernelSpecification::PythonEnv(PythonEnvKernelSpecification {
-                        name: toolchain.name.to_string(),
-                        path: PathBuf::from(&python_path),
-                        kernelspec,
-                        has_ipykernel,
-                        environment_kind,
-                    }))
+                    Some(KernelSpecification::PythonEnv(specification))
                 })
             });
 
@@ -571,6 +650,15 @@ pub fn python_env_kernel_specifications(
             .filter_map(|x| async move { x })
             .collect::<Vec<_>>()
             .await;
+
+        // `buffer_unordered` completes in whatever order the interpreter probes
+        // finish. Sort so kernel selection does not depend on that timing.
+        kernel_specs.sort_by_key(|specification| {
+            (
+                specification.path().to_string(),
+                specification.name().to_string(),
+            )
+        });
 
         #[cfg(target_os = "windows")]
         if kernel_specs.is_empty() && !is_remote {
