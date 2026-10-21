@@ -580,7 +580,9 @@ impl NotebookEditor {
                     &notebook_path,
                     &worktree_root,
                     current.as_ref(),
-                    store.selected_kernel(worktree_id),
+                    store
+                        .notebook_kernelspec(&notebook_path)
+                        .or_else(|| store.selected_kernel(worktree_id)),
                     recommended_path.as_deref(),
                     &discovered,
                 )
@@ -1056,8 +1058,8 @@ impl NotebookEditor {
     }
 
     /// Applies a kernel the user picked explicitly. Recording it in the store
-    /// makes it survive reopening any notebook in the same worktree and stops
-    /// environment discovery from overriding it.
+    /// makes it survive reopening this notebook and stops environment
+    /// discovery from overriding it.
     fn select_kernel(
         &mut self,
         spec: KernelSpecification,
@@ -1067,8 +1069,10 @@ impl NotebookEditor {
         self.deferred_kernel_adoption = None;
         let store = ReplStore::global(cx);
         let worktree_id = self.worktree_id;
-        store.update(cx, |store, cx| {
-            store.set_active_kernelspec(worktree_id, spec.clone(), cx);
+        let notebook_path = self.notebook_path.clone();
+        store.update(cx, |store, cx| match notebook_path {
+            Some(notebook_path) => store.set_notebook_kernelspec(notebook_path, spec.clone()),
+            None => store.set_active_kernelspec(worktree_id, spec.clone(), cx),
         });
         self.change_kernel(spec, window, cx);
     }
@@ -3374,6 +3378,7 @@ impl NotebookEditor {
                         kernel_status.to_string()
                     )),
                 )
+                .with_selected_kernel(self.kernel_specification.clone())
                 .with_handle(kernel_picker_handle),
             )
             .child(

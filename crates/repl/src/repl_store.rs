@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -30,6 +31,7 @@ pub struct ReplStore {
     kernel_specifications: Vec<KernelSpecification>,
     kernelspecs_initialized: bool,
     selected_kernel_for_worktree: HashMap<WorktreeId, KernelSpecification>,
+    selected_kernel_for_notebook: HashMap<PathBuf, KernelSpecification>,
     kernel_specifications_for_worktree: HashMap<WorktreeId, Vec<KernelSpecification>>,
     additional_kernel_specifications_for_worktree: HashMap<WorktreeId, Vec<KernelSpecification>>,
     active_python_toolchain_for_worktree: HashMap<WorktreeId, SharedString>,
@@ -68,6 +70,7 @@ impl ReplStore {
             kernel_specifications_for_worktree: HashMap::default(),
             additional_kernel_specifications_for_worktree: HashMap::default(),
             selected_kernel_for_worktree: HashMap::default(),
+            selected_kernel_for_notebook: HashMap::default(),
             active_python_toolchain_for_worktree: HashMap::default(),
             remote_worktrees: HashSet::default(),
             fetching_python_kernelspecs: HashSet::default(),
@@ -329,6 +332,21 @@ impl ReplStore {
             .insert(worktree_id, kernelspec);
     }
 
+    /// Records a kernel the user picked for one notebook, so that notebooks in
+    /// other directories of the same worktree keep using their own environment.
+    pub fn set_notebook_kernelspec(
+        &mut self,
+        notebook_path: PathBuf,
+        kernelspec: KernelSpecification,
+    ) {
+        self.selected_kernel_for_notebook
+            .insert(notebook_path, kernelspec);
+    }
+
+    pub fn notebook_kernelspec(&self, notebook_path: &Path) -> Option<&KernelSpecification> {
+        self.selected_kernel_for_notebook.get(notebook_path)
+    }
+
     pub fn active_python_toolchain_path(&self, worktree_id: WorktreeId) -> Option<&SharedString> {
         self.active_python_toolchain_for_worktree.get(&worktree_id)
     }
@@ -465,5 +483,53 @@ impl ReplStore {
     ) {
         self.kernel_specifications = specs;
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod notebook_selection_tests {
+    use super::*;
+    use crate::kernels::LocalKernelSpecification;
+    use gpui::TestAppContext;
+    use jupyter_protocol::JupyterKernelspec;
+    use project::FakeFs;
+
+    fn specification(name: &str) -> KernelSpecification {
+        KernelSpecification::Jupyter(LocalKernelSpecification {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            kernelspec: JupyterKernelspec {
+                argv: vec![name.to_string()],
+                display_name: name.to_string(),
+                language: "python".to_string(),
+                interrupt_mode: None,
+                metadata: None,
+                env: None,
+            },
+        })
+    }
+
+    #[gpui::test]
+    fn kernel_picked_in_one_notebook_does_not_apply_to_others(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let store = cx.update(|cx| cx.new(|cx| ReplStore::new(fs, cx)));
+
+        let first_notebook = PathBuf::from("/project/a/first.ipynb");
+        let second_notebook = PathBuf::from("/project/b/second.ipynb");
+        store.update(cx, |store, _| {
+            store.set_notebook_kernelspec(first_notebook.clone(), specification("first"));
+        });
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.notebook_kernelspec(&first_notebook),
+                Some(&specification("first"))
+            );
+            assert_eq!(store.notebook_kernelspec(&second_notebook), None);
+        });
     }
 }

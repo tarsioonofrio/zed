@@ -19,11 +19,14 @@ pub enum KernelPickerEntry {
     },
 }
 
-fn build_grouped_entries(store: &ReplStore, worktree_id: WorktreeId) -> Vec<KernelPickerEntry> {
+fn build_grouped_entries(
+    store: &ReplStore,
+    worktree_id: WorktreeId,
+    selected_kernel: Option<&KernelSpecification>,
+) -> Vec<KernelPickerEntry> {
     let mut entries = Vec::new();
     let mut recommended_entry: Option<KernelPickerEntry> = None;
     let mut found_selected = false;
-    let selected_kernel = store.selected_kernel(worktree_id);
 
     let mut python_envs = Vec::new();
     let mut jupyter_kernels = Vec::new();
@@ -137,6 +140,7 @@ where
     tooltip: TT,
     info_text: Option<SharedString>,
     worktree_id: WorktreeId,
+    selected_kernel: Option<KernelSpecification>,
 }
 
 pub struct KernelPickerDelegate {
@@ -160,11 +164,19 @@ where
             tooltip,
             info_text: None,
             worktree_id,
+            selected_kernel: None,
         }
     }
 
     pub fn with_handle(mut self, handle: PopoverMenuHandle<Picker<KernelPickerDelegate>>) -> Self {
         self.handle = Some(handle);
+        self
+    }
+
+    /// Marks this kernel as the current one instead of the worktree-wide
+    /// selection, for pickers that belong to a single notebook.
+    pub fn with_selected_kernel(mut self, kernel: Option<KernelSpecification>) -> Self {
+        self.selected_kernel = kernel;
         self
     }
 
@@ -457,8 +469,12 @@ where
         store.update(cx, |store, cx| store.ensure_kernelspecs(cx));
         let store = store.read(cx);
 
-        let all_entries = build_grouped_entries(store, self.worktree_id);
-        let selected_kernelspec = store.active_kernelspec(self.worktree_id, None, cx);
+        let selected_kernelspec = self
+            .selected_kernel
+            .clone()
+            .or_else(|| store.active_kernelspec(self.worktree_id, None, cx));
+        let all_entries =
+            build_grouped_entries(store, self.worktree_id, selected_kernelspec.as_ref());
         let selected_index = all_entries
             .iter()
             .position(|entry| {
