@@ -485,6 +485,10 @@ impl NotebookEditor {
     /// virtual environment, the previous recommendation/fallback behavior is
     /// kept unchanged.
     fn adopt_project_environment_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_via_remote_server() {
+            self.adopt_remote_kernel(window, cx);
+            return;
+        }
         let Some(notebook_path) = self.notebook_path.clone() else {
             return;
         };
@@ -543,6 +547,47 @@ impl NotebookEditor {
             .ok();
         })
         .detach();
+    }
+
+    /// Starts the notebook's kernel on the remote machine once its Python
+    /// environments are known. Nothing is launched before that, because the
+    /// local fallback kernel cannot run in a project that lives elsewhere.
+    fn adopt_remote_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.kernel_specification,
+            Some(KernelSpecification::SshRemote(_))
+        ) {
+            return;
+        }
+
+        let store = ReplStore::global(cx);
+        let worktree_id = self.worktree_id;
+        let notebook_path = self.notebook_path.clone();
+        let candidate = store.read_with(cx, |store, _| {
+            notebook_path
+                .as_deref()
+                .and_then(|path| store.notebook_kernelspec(path))
+                .or_else(|| store.selected_kernel(worktree_id))
+                .or_else(|| {
+                    store
+                        .kernel_specifications_for_worktree(worktree_id)
+                        .find(|specification| {
+                            matches!(specification, KernelSpecification::SshRemote(_))
+                        })
+                })
+                .cloned()
+        });
+
+        match candidate {
+            Some(specification) => self.change_kernel(specification, window, cx),
+            None => self.kernel_errored(
+                "No Python environment with ipykernel was found on the remote machine. \
+                 Install it there (for example `python -m pip install ipykernel` inside a \
+                 .venv next to the notebook) and reopen the notebook."
+                    .to_string(),
+                cx,
+            ),
+        }
     }
 
     fn apply_project_environment_adoption(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -880,6 +925,11 @@ impl NotebookEditor {
                 .read(cx)
                 .active_kernelspec(self.worktree_id, None, cx)
         });
+
+        if spec.is_none() && self.project.read(cx).is_via_remote_server() {
+            // Environment discovery on the remote machine starts the kernel.
+            return;
+        }
 
         let spec = spec.unwrap_or_else(|| {
             KernelSpecification::Jupyter(LocalKernelSpecification {

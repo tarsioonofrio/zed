@@ -502,6 +502,146 @@ pub(crate) async fn probe_python_environment_interpreter(
     )
 }
 
+/// How long the remote server gets to list Python environments before the
+/// directly probed ones are used alone. The listing can stall indefinitely on
+/// hosts where the server's shell environment capture never finishes.
+const REMOTE_TOOLCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+const REMOTE_PYTHON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn remote_python_probe_script(notebook_directory: &str) -> String {
+    let directory = shlex::try_quote(notebook_directory)
+        .map(|quoted| quoted.into_owned())
+        .unwrap_or_else(|_| "'.'".to_string());
+    format!(
+        r#"probe() {{
+  python="$1"
+  [ -x "$python" ] || return 0
+  version=$("$python" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null) || return 0
+  if "$python" -c 'import ipykernel' >/dev/null 2>&1; then ipykernel=1; else ipykernel=0; fi
+  printf 'ZED_PYTHON\t%s\t%s\t%s\t%s\n' "$python" "$version" "$ipykernel" "$2"
+}}
+directory={directory}
+while :; do
+  for name in .venv venv; do probe "$directory/$name/bin/python" "$name"; done
+  [ "$directory" = "/" ] && break
+  directory=$(dirname "$directory")
+done
+for name in python3 python; do
+  found=$(command -v "$name" 2>/dev/null) && probe "$found" system
+done
+[ -n "$CONDA_PREFIX" ] && probe "$CONDA_PREFIX/bin/python" conda
+base=$(conda info --base 2>/dev/null) && roots="$base"
+for root in "$HOME/mambaforge" "$HOME/miniforge3" "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/micromamba" /opt/conda; do
+  roots="$roots
+$root"
+done
+printf '%s\n' "$roots" | awk 'NF && !seen[$0]++' | while IFS= read -r root; do
+  probe "$root/bin/python" conda
+  for environment in "$root"/envs/*/; do probe "${{environment}}bin/python" "conda:$(basename "$environment")"; done
+done
+for version in "$HOME"/.pyenv/versions/*/; do probe "${{version}}bin/python" "pyenv:$(basename "$version")"; done
+exit 0
+"#
+    )
+}
+
+fn parse_remote_python_probe_output(output: &str) -> Vec<SshRemoteKernelSpecification> {
+    let mut seen = collections::HashSet::default();
+    let mut specifications = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        if fields.next() != Some("ZED_PYTHON") {
+            continue;
+        }
+        let (Some(path), Some(version), Some(has_ipykernel), Some(kind)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if has_ipykernel != "1" || !seen.insert(path.to_string()) {
+            continue;
+        }
+        let display_name = format!("Python {version} ({kind})");
+        specifications.push(SshRemoteKernelSpecification {
+            name: format!("Remote {display_name}"),
+            path: SharedString::from(path.to_string()),
+            kernelspec: JupyterKernelspec {
+                argv: vec![
+                    path.to_string(),
+                    "-m".to_string(),
+                    "ipykernel_launcher".to_string(),
+                    "-f".to_string(),
+                    "{connection_file}".to_string(),
+                ],
+                display_name,
+                language: "python".to_string(),
+                interrupt_mode: None,
+                metadata: None,
+                env: None,
+            },
+        });
+    }
+    specifications
+}
+
+/// Finds Python environments that have `ipykernel` on the remote host by
+/// running a probe script there, nearest virtual environment first. This does
+/// not depend on the remote server's toolchain listing.
+fn probe_remote_python_environments(
+    project: &Entity<Project>,
+    notebook_directory: PathBuf,
+    cx: &App,
+) -> Task<Vec<SshRemoteKernelSpecification>> {
+    let Some(remote_client) = project.read(cx).remote_client() else {
+        return Task::ready(Vec::new());
+    };
+    let script = remote_python_probe_script(&notebook_directory.to_string_lossy());
+    let command = remote_client.read(cx).build_command(
+        Some("bash".to_string()),
+        &["-lc".to_string(), script],
+        &HashMap::default(),
+        None,
+        None,
+        remote::Interactive::No,
+    );
+    let command = match command {
+        Ok(command) => command,
+        Err(error) => {
+            log::warn!("remote python probe: could not build the ssh command: {error:#}");
+            return Task::ready(Vec::new());
+        }
+    };
+    let timer = cx.background_executor().timer(REMOTE_PYTHON_PROBE_TIMEOUT);
+    cx.background_spawn(async move {
+        let mut command_builder = util::command::new_command(&command.program);
+        command_builder.args(&command.args).envs(&command.env);
+        let output = smol::future::or(
+            async { command_builder.output().await.map_err(anyhow::Error::from) },
+            async {
+                timer.await;
+                Err(anyhow::anyhow!("timed out"))
+            },
+        )
+        .await;
+        match output {
+            Ok(output) => {
+                let specifications =
+                    parse_remote_python_probe_output(&String::from_utf8_lossy(&output.stdout));
+                log::info!(
+                    "remote python probe found {} environments with ipykernel",
+                    specifications.len()
+                );
+                specifications
+            }
+            Err(error) => {
+                log::warn!("remote python probe failed: {error:#}");
+                Vec::new()
+            }
+        }
+    })
+}
+
 pub fn python_env_kernel_specifications(
     project: &Entity<Project>,
     worktree_id: WorktreeId,
@@ -524,7 +664,7 @@ pub fn python_env_kernel_specifications(
     let toolchains = project.read(cx).available_toolchains(
         ProjectPath {
             worktree_id,
-            path: relative_path,
+            path: relative_path.clone(),
         },
         python_language,
         cx,
@@ -535,18 +675,60 @@ pub fn python_env_kernel_specifications(
         .worktree_for_id(worktree_id, cx)
         .map(|w| w.read(cx).abs_path());
 
+    let remote_probe = if is_remote && wsl_distro.is_none() {
+        let is_single_file = project
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)
+            .is_some_and(|worktree| worktree.read(cx).is_single_file());
+        worktree_root_path.as_ref().map(|root| {
+            let notebook_directory = if is_single_file {
+                root.parent().unwrap_or(root.as_ref()).to_path_buf()
+            } else {
+                relative_path
+                    .parent()
+                    .map(|parent| root.join(parent.as_std_path()))
+                    .unwrap_or_else(|| root.to_path_buf())
+            };
+            probe_remote_python_environments(project, notebook_directory, cx)
+        })
+    } else {
+        None
+    };
+
     let background_executor = cx.background_executor().clone();
 
     async move {
+        let probed_remote_specifications = match remote_probe {
+            Some(probe) => probe.await,
+            None => Vec::new(),
+        };
+
+        let toolchains = if is_remote {
+            let timeout = background_executor.timer(REMOTE_TOOLCHAIN_TIMEOUT);
+            smol::future::or(toolchains, async {
+                timeout.await;
+                log::warn!(
+                    "listing remote python environments timed out; using the probed ones"
+                );
+                None
+            })
+            .await
+        } else {
+            toolchains.await
+        };
+
         let (toolchains, user_toolchains) = if let Some(Toolchains {
             toolchains,
             root_path: _,
             user_toolchains,
-        }) = toolchains.await
+        }) = toolchains
         {
             (toolchains, user_toolchains)
         } else {
-            return Ok(Vec::new());
+            return Ok(probed_remote_specifications
+                .into_iter()
+                .map(KernelSpecification::SshRemote)
+                .collect());
         };
 
         let kernelspecs = user_toolchains
@@ -651,14 +833,35 @@ pub fn python_env_kernel_specifications(
             .collect::<Vec<_>>()
             .await;
 
-        // `buffer_unordered` completes in whatever order the interpreter probes
-        // finish. Sort so kernel selection does not depend on that timing.
-        kernel_specs.sort_by_key(|specification| {
-            (
-                specification.path().to_string(),
-                specification.name().to_string(),
-            )
-        });
+        if probed_remote_specifications.is_empty() {
+            // `buffer_unordered` completes in whatever order the interpreter probes
+            // finish. Sort so kernel selection does not depend on that timing.
+            kernel_specs.sort_by_key(|specification| {
+                (
+                    specification.path().to_string(),
+                    specification.name().to_string(),
+                )
+            });
+        } else {
+            // The probed environments come nearest first, which is the order
+            // kernel selection relies on.
+            let probed_paths = probed_remote_specifications
+                .iter()
+                .map(|specification| specification.path.to_string())
+                .collect::<collections::HashSet<_>>();
+            kernel_specs.retain(|specification| match specification {
+                KernelSpecification::SshRemote(remote) => {
+                    !probed_paths.contains(remote.path.as_ref())
+                }
+                _ => true,
+            });
+            let mut combined = probed_remote_specifications
+                .into_iter()
+                .map(KernelSpecification::SshRemote)
+                .collect::<Vec<_>>();
+            combined.extend(kernel_specs);
+            kernel_specs = combined;
+        }
 
         #[cfg(target_os = "windows")]
         if kernel_specs.is_empty() && !is_remote {
@@ -851,5 +1054,47 @@ impl Kernel {
             | Kernel::ErroredLaunch(_)
             | Kernel::Shutdown => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_probe_tests {
+    use super::*;
+
+    #[test]
+    fn probe_output_keeps_only_environments_with_ipykernel_without_duplicates() {
+        let output = "banner from the login shell\n\
+            ZED_PYTHON\t/work/.venv/bin/python\t3.12.1\t1\t.venv\n\
+            ZED_PYTHON\t/usr/bin/python3\t3.6.8\t0\tsystem\n\
+            ZED_PYTHON\t/work/.venv/bin/python\t3.12.1\t1\tvenv\n\
+            ZED_PYTHON\t/opt/conda/bin/python\t3.10.13\t1\tconda\n\
+            ZED_PYTHON\tbroken line\n";
+
+        let specifications = parse_remote_python_probe_output(output);
+
+        let names = specifications
+            .iter()
+            .map(|specification| specification.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["Remote Python 3.12.1 (.venv)", "Remote Python 3.10.13 (conda)"]
+        );
+        assert_eq!(
+            specifications[0].kernelspec.argv,
+            [
+                "/work/.venv/bin/python",
+                "-m",
+                "ipykernel_launcher",
+                "-f",
+                "{connection_file}"
+            ]
+        );
+    }
+
+    #[test]
+    fn probe_script_quotes_the_notebook_directory() {
+        let script = remote_python_probe_script("/work/my notebooks");
+        assert!(script.contains("directory='/work/my notebooks'"));
     }
 }
