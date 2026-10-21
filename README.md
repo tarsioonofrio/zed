@@ -5,6 +5,8 @@
 
 A fork of [Zed](https://github.com/zed-industries/zed) built to give it complete Jupyter notebook support, in Zed's own style: `.ipynb` files open as native notebooks, with the same editor, language servers and agent that you use for any other file. The notebook code lives in separate crates (`notebook_lsp`, `notebook_variables`, `notebook_cell_context`, `notebook_agent_tools`) and in `crates/repl`, so the branch stays easy to rebase onto upstream.
 
+![A notebook in Zed Notebook: a markdown cell with rendered math, code cells and the variables panel](assets/notebook/notebook-overview.png)
+
 ## What it supports
 
 - **Notebook editing**: code and markdown cells with outputs, cell numbers and execution counts, plus cell actions (split, merge, convert between code and markdown, clear outputs, collapse outputs, run above or below, undo and redo of structure changes). An empty `.ipynb` file opens as a new Python notebook.
@@ -13,6 +15,8 @@ A fork of [Zed](https://github.com/zed-industries/zed) built to give it complete
 - **Variables panel and data viewer**: inspect the variables of a Python kernel, on the right or at the bottom of the notebook.
 - **Agent tools**: the Zed agent can read and edit notebook cells.
 - **SSH remote projects**: notebooks in a remote project run their kernel on the remote machine and get the language servers installed there.
+
+![Cell outputs: execution time, values and a matplotlib figure, next to the variables panel](assets/notebook/notebook-outputs.png)
 
 Notebook settings are documented in [docs/src/repl.md](docs/src/repl.md). The rest of this file is the original Zed README.
 
