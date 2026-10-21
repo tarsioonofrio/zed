@@ -27,7 +27,7 @@ use editor::{
 use fs::Fs;
 use futures::{StreamExt as _, future::Shared};
 use gpui::{
-    App, AsyncApp, BackgroundExecutor, Context, Entity, FutureExt, Subscription, Task, TaskExt, WeakEntity,
+    App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, FutureExt, Subscription, Task, TaskExt, WeakEntity,
     Window,
 };
 use language::{
@@ -298,6 +298,8 @@ pub struct NotebookLsp {
     owns_document: bool,
 }
 
+const REMOTE_LINK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Project-relative directory that holds the virtual documents of notebooks.
 const NOTEBOOK_DOCUMENT_DIRECTORY: &str = ".zed/notebook";
 
@@ -325,6 +327,70 @@ async fn link_sibling_modules(
             .with_context(|| format!("link {} into the notebook cache", entry.display()))?;
     }
     Ok(())
+}
+
+/// The remote counterpart of [`link_sibling_modules`]: the project filesystem has no
+/// remote symlink operation, so the links are made by a short script over SSH.
+fn link_remote_sibling_modules(
+    project: &Entity<Project>,
+    notebook_directory: &Path,
+    document_path: &Path,
+    cx: &App,
+) -> Task<Result<()>> {
+    const SCRIPT: &str = r#"
+notebook_directory="$1"; document_directory="$2"; skipped="$3"
+cd "$notebook_directory" || exit 0
+for entry in *; do
+    [ "$entry" = "$skipped" ] && continue
+    [ -e "$entry" ] || continue
+    [ -e "$document_directory/$entry" ] || [ -L "$document_directory/$entry" ] \
+        || ln -s "$notebook_directory/$entry" "$document_directory/$entry"
+done
+"#;
+    let Some(remote_client) = project.read(cx).remote_client() else {
+        return Task::ready(Ok(()));
+    };
+    let (Some(document_directory), Some(document_name)) =
+        (document_path.parent(), document_path.file_name())
+    else {
+        return Task::ready(Ok(()));
+    };
+    let arguments = [
+        "-lc".to_string(),
+        SCRIPT.to_string(),
+        "link-siblings".to_string(),
+        notebook_directory.to_string_lossy().into_owned(),
+        document_directory.to_string_lossy().into_owned(),
+        document_name.to_string_lossy().into_owned(),
+    ];
+    let command = remote_client.read(cx).build_command(
+        Some("bash".to_string()),
+        &arguments,
+        &HashMap::default(),
+        None,
+        None,
+        remote::Interactive::No,
+    );
+    let timer = cx.background_executor().timer(REMOTE_LINK_TIMEOUT);
+    cx.background_spawn(async move {
+        let command = command.context("build the ssh command to link sibling modules")?;
+        let mut builder = util::command::new_command(&command.program);
+        builder.args(&command.args).envs(&command.env);
+        let output = smol::future::or(
+            async { builder.output().await.map_err(anyhow::Error::from) },
+            async {
+                timer.await;
+                Err(anyhow::anyhow!("timed out"))
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "linking sibling modules failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    })
 }
 
 impl NotebookLsp {
@@ -599,22 +665,31 @@ impl NotebookLsp {
                     this.update(cx, |this, _| this.owns_document = true)?;
                 }
 
+                // Language servers resolve imports relative to the importing file first,
+                // so the modules next to the notebook are linked in beside the document.
+                let document_path = root.join(&layout);
                 let is_remote = project.read_with(cx, |project, _| project.is_via_remote_server());
-                if !is_remote {
-                    // Language servers resolve imports relative to the importing file first,
-                    // so the modules next to the notebook are linked in beside the document.
-                    let document_path = root.join(&layout);
-                    if let Some(document_directory) = document_path.parent() {
-                        let fs = project.read_with(cx, |project, _| project.fs().clone());
-                        link_sibling_modules(
-                            fs.as_ref(),
+                if is_remote {
+                    cx.update(|cx| {
+                        link_remote_sibling_modules(
+                            &project,
                             &notebook_directory,
-                            document_directory,
                             &document_path,
+                            cx,
                         )
-                        .await
-                        .log_err();
-                    }
+                    })
+                    .await
+                    .log_err();
+                } else if let Some(document_directory) = document_path.parent() {
+                    let fs = project.read_with(cx, |project, _| project.fs().clone());
+                    link_sibling_modules(
+                        fs.as_ref(),
+                        &notebook_directory,
+                        document_directory,
+                        &document_path,
+                    )
+                    .await
+                    .log_err();
                 }
                 log::info!(
                     "notebook_lsp: virtual document {} for {}",
@@ -1988,7 +2063,7 @@ fn remap_location_link(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::TestAppContext;
     use project::FakeFs;
     use settings::SettingsStore;
 
