@@ -8,7 +8,7 @@ use std::{any::TypeId, ops::RangeInclusive, path::PathBuf, sync::Arc};
 use anyhow::{Context as _, Result, anyhow};
 use client::proto::ViewId;
 use collections::HashMap;
-use editor::{Anchor, DisplayPoint, Editor};
+use editor::{DisplayPoint, Editor};
 use feature_flags::{FeatureFlagAppExt as _, NotebookFeatureFlag};
 use futures::FutureExt;
 use futures::future::Shared;
@@ -27,15 +27,12 @@ use notebook_agent_tools::{
     NotebookSnapshot,
 };
 use notebook_lsp::{NotebookCell, NotebookLsp};
-use project::search::SearchQuery;
 use project::{Fs, Project, ProjectEntryId, ProjectPath};
-use settings::{Settings as _, SeedQuerySetting};
+use settings::Settings as _;
 use ui::{CommonAnimationExt, ContextMenu, KeyBinding, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::item::{ItemEvent, SaveOptions, TabContentParams};
-use workspace::searchable::{
-    Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
-};
+use workspace::searchable::SearchableItemHandle;
 use workspace::{Item, ItemHandle, Pane, ProjectItem, ToolbarItemLocation, Workspace};
 
 use super::{
@@ -4437,271 +4434,6 @@ impl EventEmitter<()> for NotebookItem {}
 
 impl EventEmitter<()> for NotebookEditor {}
 
-impl EventEmitter<SearchEvent> for NotebookEditor {}
-
-/// A match inside one cell's editor. Matches are ordered by cell, then by
-/// position in the cell.
-#[derive(Clone)]
-pub struct NotebookSearchMatch {
-    cell_id: CellId,
-    range: std::ops::Range<Anchor>,
-}
-
-impl NotebookEditor {
-    fn searchable_cell_editors(&self, cx: &App) -> Vec<(CellId, Entity<Editor>)> {
-        self.cell_order
-            .iter()
-            .filter_map(|cell_id| {
-                let editor = self.cell_map.get(cell_id)?.editor(cx)?.clone();
-                Some((cell_id.clone(), editor))
-            })
-            .collect()
-    }
-
-    fn cell_editor(&self, cell_id: &CellId, cx: &App) -> Option<Entity<Editor>> {
-        self.cell_map.get(cell_id)?.editor(cx).cloned()
-    }
-}
-
-impl SearchableItem for NotebookEditor {
-    type Match = NotebookSearchMatch;
-
-    fn supported_options(&self) -> SearchOptions {
-        SearchOptions {
-            case: true,
-            word: true,
-            regex: true,
-            replacement: true,
-            selection: false,
-            select_all: false,
-            find_in_results: false,
-        }
-    }
-
-    fn clear_matches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for (_, editor) in self.searchable_cell_editors(cx) {
-            editor.update(cx, |editor, cx| editor.clear_matches(window, cx));
-        }
-    }
-
-    fn update_matches(
-        &mut self,
-        matches: &[Self::Match],
-        active_match_index: Option<usize>,
-        token: SearchToken,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for (cell_id, editor) in self.searchable_cell_editors(cx) {
-            let ranges: Vec<_> = matches
-                .iter()
-                .filter(|search_match| search_match.cell_id == cell_id)
-                .map(|search_match| search_match.range.clone())
-                .collect();
-            let active_in_cell = active_match_index
-                .filter(|index| {
-                    matches
-                        .get(*index)
-                        .is_some_and(|search_match| search_match.cell_id == cell_id)
-                })
-                .map(|index| {
-                    matches[..index]
-                        .iter()
-                        .filter(|search_match| search_match.cell_id == cell_id)
-                        .count()
-                });
-            editor.update(cx, |editor, cx| {
-                editor.update_matches(&ranges, active_in_cell, token, window, cx)
-            });
-        }
-    }
-
-    fn query_suggestion(
-        &mut self,
-        seed_query_override: Option<SeedQuerySetting>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> String {
-        let Some(editor) = self
-            .focused_cell()
-            .and_then(|cell| cell.editor(cx))
-            .cloned()
-        else {
-            return String::new();
-        };
-        editor.update(cx, |editor, cx| {
-            editor.query_suggestion(seed_query_override, window, cx)
-        })
-    }
-
-    fn activate_match(
-        &mut self,
-        index: usize,
-        matches: &[Self::Match],
-        token: SearchToken,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(active_match) = matches.get(index) else {
-            return;
-        };
-        let cell_id = active_match.cell_id.clone();
-        let Some(cell_index) = self
-            .cell_order
-            .iter()
-            .position(|candidate| *candidate == cell_id)
-        else {
-            return;
-        };
-        let Some(editor) = self.cell_editor(&cell_id, cx) else {
-            return;
-        };
-
-        if let Some(Cell::Markdown(markdown_cell)) = self.cell_map.get(&cell_id) {
-            markdown_cell.update(cx, |markdown_cell, cx| {
-                if !markdown_cell.is_editing() {
-                    markdown_cell.set_editing(true);
-                    cx.notify();
-                }
-            });
-        }
-
-        let ranges: Vec<_> = matches
-            .iter()
-            .filter(|search_match| search_match.cell_id == cell_id)
-            .map(|search_match| search_match.range.clone())
-            .collect();
-        let index_in_cell = matches[..index]
-            .iter()
-            .filter(|search_match| search_match.cell_id == cell_id)
-            .count();
-
-        self.set_selected_index(cell_index, true, window, cx);
-        editor.update(cx, |editor, cx| {
-            editor.activate_match(index_in_cell, &ranges, token, window, cx)
-        });
-        cx.notify();
-    }
-
-    fn select_matches(
-        &mut self,
-        _matches: &[Self::Match],
-        _token: SearchToken,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
-    fn replace(
-        &mut self,
-        search_match: &Self::Match,
-        query: &SearchQuery,
-        token: SearchToken,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(editor) = self.cell_editor(&search_match.cell_id, cx) else {
-            return;
-        };
-        editor.update(cx, |editor, cx| {
-            editor.replace(&search_match.range, query, token, window, cx)
-        });
-    }
-
-    fn find_matches(
-        &mut self,
-        query: Arc<SearchQuery>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<Vec<Self::Match>> {
-        let searches: Vec<_> = self
-            .searchable_cell_editors(cx)
-            .into_iter()
-            .map(|(cell_id, editor)| {
-                let task = editor.update(cx, |editor, cx| {
-                    editor.find_matches(query.clone(), window, cx)
-                });
-                (cell_id, task)
-            })
-            .collect();
-
-        cx.spawn(async move |_, _| {
-            let mut all_matches = Vec::new();
-            for (cell_id, task) in searches {
-                for range in task.await {
-                    all_matches.push(NotebookSearchMatch {
-                        cell_id: cell_id.clone(),
-                        range,
-                    });
-                }
-            }
-            all_matches
-        })
-    }
-
-    fn active_match_index(
-        &mut self,
-        direction: Direction,
-        matches: &[Self::Match],
-        _token: SearchToken,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        if matches.is_empty() {
-            return None;
-        }
-
-        let selected_cell_index = self.selected_cell_index;
-        let cursor = self
-            .cell_order
-            .get(selected_cell_index)
-            .and_then(|cell_id| self.cell_editor(cell_id, cx))
-            .map(|editor| {
-                let editor = editor.read(cx);
-                (
-                    *editor.selections.newest_anchor(),
-                    editor.buffer().read(cx).snapshot(cx),
-                )
-            });
-
-        let order_against_cursor = |search_match: &NotebookSearchMatch| {
-            let match_cell_index = self
-                .cell_order
-                .iter()
-                .position(|cell_id| *cell_id == search_match.cell_id)?;
-            Some(match match_cell_index.cmp(&selected_cell_index) {
-                std::cmp::Ordering::Equal => match &cursor {
-                    Some((selection, snapshot)) => {
-                        let ordering = search_match.range.start.cmp(&selection.start, snapshot);
-                        if ordering.is_eq() && selection.start != selection.end {
-                            std::cmp::Ordering::Less
-                        } else {
-                            ordering
-                        }
-                    }
-                    None => std::cmp::Ordering::Equal,
-                },
-                ordering => ordering,
-            })
-        };
-
-        match direction {
-            Direction::Next => matches
-                .iter()
-                .position(|search_match| {
-                    order_against_cursor(search_match).is_some_and(|ordering| ordering.is_ge())
-                })
-                .or(Some(0)),
-            Direction::Prev => matches
-                .iter()
-                .rposition(|search_match| {
-                    order_against_cursor(search_match).is_some_and(|ordering| ordering.is_lt())
-                })
-                .or(Some(matches.len() - 1)),
-        }
-    }
-}
-
 // pub struct NotebookControls {
 //     pane_focused: bool,
 //     active_item: Option<Box<dyn ItemHandle>>,
@@ -4832,7 +4564,7 @@ impl Item for NotebookEditor {
     }
 
     fn show_toolbar(&self) -> bool {
-        true
+        false
     }
 
     // TODO
@@ -4840,12 +4572,9 @@ impl Item for NotebookEditor {
         None
     }
 
-    fn as_searchable(
-        &self,
-        handle: &Entity<Self>,
-        _: &App,
-    ) -> Option<Box<dyn SearchableItemHandle>> {
-        Some(Box::new(handle.clone()))
+    // TODO
+    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
+        None
     }
 
     fn set_nav_history(

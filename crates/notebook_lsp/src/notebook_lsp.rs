@@ -977,9 +977,6 @@ impl NotebookLsp {
             let entries: Vec<DiagnosticEntry<Anchor>> = source_entries
                 .iter()
                 .filter_map(|(range, diagnostic)| {
-                    if is_cross_cell_redeclaration(diagnostic) {
-                        return None;
-                    }
                     let start =
                         translate_anchor(&range.start, &document_snapshot, &cell_snapshot, &span)?;
                     let end =
@@ -995,16 +992,6 @@ impl NotebookLsp {
             cell_buffer.update(cx, |buffer, cx| buffer.update_diagnostics(server_id, set, cx));
         }
     }
-}
-
-/// Defining the same function or variable again in a later cell is how
-/// notebooks are normally used, so redeclaration diagnostics are noise once
-/// the cells are joined into one document.
-fn is_cross_cell_redeclaration(diagnostic: &Diagnostic) -> bool {
-    matches!(
-        &diagnostic.code,
-        Some(lsp::NumberOrString::String(code)) if code == "reportRedeclaration" || code == "F811"
-    )
 }
 
 fn translate_anchor(
@@ -2993,22 +2980,6 @@ mod tests {
             assert_eq!(notebook.python_interpreter.as_ref(), Some(&interpreter));
             assert!(notebook.document.is_none());
         });
-    }
-
-    #[test]
-    fn redeclaration_diagnostics_are_recognized_by_code() {
-        let diagnostic_with_code = |code: &str| Diagnostic {
-            code: Some(lsp::NumberOrString::String(code.to_string())),
-            ..Default::default()
-        };
-        assert!(is_cross_cell_redeclaration(&diagnostic_with_code(
-            "reportRedeclaration"
-        )));
-        assert!(is_cross_cell_redeclaration(&diagnostic_with_code("F811")));
-        assert!(!is_cross_cell_redeclaration(&diagnostic_with_code(
-            "reportUndefinedVariable"
-        )));
-        assert!(!is_cross_cell_redeclaration(&Diagnostic::default()));
     }
 
     #[test]
