@@ -258,12 +258,13 @@ pub(crate) fn convert_outputs(
                 Output::new(&execute_result.data, None, output.clone(), window, cx)
             }
             nbformat::v4::Output::Error(error) => Output::ErrorOutput {
-                content: ErrorView {
-                    ename: error.ename.clone(),
-                    evalue: error.evalue.clone(),
-                    traceback: cx
-                        .new(|cx| TerminalOutput::from(&error.traceback.join("\n"), window, cx)),
-                },
+                content: ErrorView::new(
+                    error.ename.clone(),
+                    error.evalue.clone(),
+                    &error.traceback.join("\n"),
+                    window,
+                    cx,
+                ),
                 nbformat: Some(output.clone()),
             },
         })
@@ -1467,11 +1468,13 @@ impl CodeCell {
         cx: &mut Context<Self>,
     ) {
         self.outputs.push(Output::ErrorOutput {
-            content: ErrorView {
-                ename: "Kernel Error".to_string(),
-                evalue: "cell could not be executed".to_string(),
-                traceback: cx.new(|cx| TerminalOutput::from(error_message, window, cx)),
-            },
+            content: ErrorView::new(
+                "Kernel Error".to_string(),
+                "cell could not be executed".to_string(),
+                error_message,
+                window,
+                cx,
+            ),
             nbformat: Some(nbformat::v4::Output::Error(nbformat::v4::ErrorOutput {
                 ename: "Kernel Error".to_string(),
                 evalue: "cell could not be executed".to_string(),
@@ -1557,12 +1560,13 @@ impl CodeCell {
             }
             JupyterMessageContent::ErrorOutput(error) => {
                 self.outputs.push(Output::ErrorOutput {
-                    content: ErrorView {
-                        ename: error.ename.clone(),
-                        evalue: error.evalue.clone(),
-                        traceback: cx
-                            .new(|cx| TerminalOutput::from(&error.traceback.join("\n"), window, cx)),
-                    },
+                    content: ErrorView::new(
+                        error.ename.clone(),
+                        error.evalue.clone(),
+                        &error.traceback.join("\n"),
+                        window,
+                        cx,
+                    ),
                     nbformat: Some(nbformat::v4::Output::Error(nbformat::v4::ErrorOutput {
                         ename: error.ename.clone(),
                         evalue: error.evalue.clone(),

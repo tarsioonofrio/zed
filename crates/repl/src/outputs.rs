@@ -339,9 +339,8 @@ impl Output {
                         .child({
                             let ename = err.ename.clone();
                             let evalue = err.evalue.clone();
-                            let traceback = err.traceback.clone();
-                            let traceback_text = traceback.read(cx).full_text(cx);
-                            let full_error = format!("{}: {}\n{}", ename, evalue, traceback_text);
+                            let full_error =
+                                format!("{}: {}\n{}", ename, evalue, err.traceback_text);
 
                             CopyButton::new("copy-full-error", full_error)
                                 .tooltip_label("Copy Full Error")
@@ -356,10 +355,9 @@ impl Output {
                             .on_click({
                                 let ename = err.ename.clone();
                                 let evalue = err.evalue.clone();
-                                let traceback = err.traceback.clone();
+                                let traceback_text = err.traceback_text.clone();
                                 move |_, window, cx| {
                                     if let Some(workspace) = workspace.upgrade() {
-                                        let traceback_text = traceback.read(cx).full_text(cx);
                                         let full_error =
                                             format!("{}: {}\n{}", ename, evalue, traceback_text);
                                         let buffer = cx.new(|cx| {
@@ -703,15 +701,14 @@ impl ExecutionView {
                 }
             }
             JupyterMessageContent::ErrorOutput(result) => {
-                let terminal =
-                    cx.new(|cx| TerminalOutput::from(&result.traceback.join("\n"), window, cx));
-
                 Output::ErrorOutput {
-                    content: ErrorView {
-                        ename: result.ename.clone(),
-                        evalue: result.evalue.clone(),
-                        traceback: terminal,
-                    },
+                    content: ErrorView::new(
+                        result.ename.clone(),
+                        result.evalue.clone(),
+                        &result.traceback.join("\n"),
+                        window,
+                        cx,
+                    ),
                     nbformat: Some(nbformat::v4::Output::Error(nbformat::v4::ErrorOutput {
                         ename: result.ename.clone(),
                         evalue: result.evalue.clone(),
@@ -1274,7 +1271,7 @@ mod tests {
                     ename: "NameError".to_string(),
                     evalue: "name 'x' is not defined".to_string(),
                     traceback: vec![
-                        "Traceback (most recent call last):".to_string(),
+                        "\u{1b}[0;31mTraceback (most recent call last):\u{1b}[0m".to_string(),
                         "NameError: name 'x' is not defined".to_string(),
                     ],
                 });
@@ -1289,6 +1286,10 @@ mod tests {
                 Output::ErrorOutput { content, .. } => {
                     assert_eq!(content.ename, "NameError");
                     assert_eq!(content.evalue, "name 'x' is not defined");
+                    assert_eq!(
+                        content.traceback_text,
+                        "Traceback (most recent call last):\nNameError: name 'x' is not defined"
+                    );
                 }
                 other => panic!(
                     "expected ErrorOutput, got {:?}",
