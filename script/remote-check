@@ -14,7 +14,7 @@ fi
 cd "$(git rev-parse --show-toplevel)"
 
 remote_host=${REMOTE_CHECK_HOST:-ssh-workstation}
-remote_root=${REMOTE_CHECK_ROOT:-/sim/tarsio.onofrio/zed-build}
+remote_root=${REMOTE_CHECK_ROOT:-/sim/tarsio.onofrio/etc/zed-build}
 # A lane keeps its own source tree, target dir and logs so parallel workers do not collide.
 lane=${REMOTE_CHECK_LANE:-}
 work_name=work${lane:+-$lane}
