@@ -760,12 +760,13 @@ impl NotebookLsp {
         let Some(document) = self.document.as_mut() else {
             return;
         };
-        if document.text == new_text {
+        // The buffer may already hold content from a previous session's file, so it
+        // is compared and replaced as it is, not as the cached text assumes.
+        let buffer = document.buffer.clone();
+        let old_length = buffer.read(cx).len();
+        if document.text == new_text && buffer.read(cx).text() == new_text {
             return;
         }
-
-        let old_length = document.text.len();
-        let buffer = document.buffer.clone();
         buffer.update(cx, |buffer, cx| {
             buffer.edit([(0..old_length, new_text.clone())], None, cx);
         });
@@ -2289,6 +2290,65 @@ mod tests {
             (cell_id("cell-two"), "y = x + 1".to_string()),
         ]);
         assert_eq!(document_text, expected);
+        assert_eq!(buffer_text, expected);
+    }
+
+    #[gpui::test]
+    async fn virtual_document_replaces_stale_content_left_on_disk(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/notebooks",
+            serde_json::json!({
+                ".zed": { "notebook": { "demo.txt": "class Model:\n    pass\n\n" } }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new("/notebooks")], cx).await;
+        let notebook = cx.update(|cx| {
+            cx.new(|cx| {
+                NotebookLsp::new(project.clone(), PathBuf::from("/notebooks/demo.ipynb"), None, cx)
+            })
+        });
+
+        let window = cx.add_empty_window();
+        let buffer =
+            window.update(|_window, cx| cx.new(|cx| Buffer::local("class Model:\n    pass", cx)));
+        let editor = window.update(|window, cx| {
+            cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx))
+        });
+        let cells = vec![NotebookCell {
+            id: cell_id("cell-one"),
+            editor,
+            buffer,
+        }];
+        notebook.update(cx, |notebook, cx| notebook.set_cells(cells, cx));
+
+        let setup_task = notebook
+            .update(cx, |notebook, _| notebook._setup_task.take())
+            .expect("notebook LSP setup task should have been spawned");
+        setup_task.await;
+        cx.run_until_parked();
+
+        let buffer_text = notebook.read_with(cx, |notebook, cx| {
+            notebook
+                .document
+                .as_ref()
+                .expect("virtual document should have been created")
+                .buffer
+                .read(cx)
+                .text()
+        });
+        let (expected, _) = build_document(&[(
+            cell_id("cell-one"),
+            "class Model:\n    pass".to_string(),
+        )]);
         assert_eq!(buffer_text, expected);
     }
 
