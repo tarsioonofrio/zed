@@ -8052,6 +8052,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_code_cells_receive_the_hosting_workspace(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
