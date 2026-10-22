@@ -1686,6 +1686,14 @@
     },
   },
   {
+    "context": "NotebookEditor > Editor && mode == auto_height",
+    "bindings": {
+      "escape": "editor::Cancel",
+      "ctrl-enter": "editor::Newline",
+      "shift-enter": "editor::Newline",
+    },
+  },
+  {
     "context": "GitGraph",
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",
