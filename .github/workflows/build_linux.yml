@@ -1,0 +1,36 @@
+name: build_linux
+# Builds the zed binary on a GitHub-hosted runner, without running tests.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Keeps the build within the hosted runner's disk and time limits.
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        df -h /
+    - uses: actions/checkout@v4
+    - name: Install system dependencies
+      run: ./script/linux
+    - name: Build zed
+      run: cargo build --release --package zed --locked
+    - name: Strip and package
+      run: |
+        strip target/release/zed
+        ls -l target/release/zed
+    - uses: actions/upload-artifact@v4
+      with:
+        name: zed-linux-x86_64
+        path: target/release/zed
+        if-no-files-found: error
