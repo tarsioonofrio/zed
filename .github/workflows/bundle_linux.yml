@@ -1,7 +1,10 @@
 name: bundle_linux
 # Builds the Linux release bundle without the remote server and without Sentry, and without running tests.
+# A push to main (a merged pull request) also publishes the bundle as a GitHub release.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,3 +35,27 @@ jobs:
         name: zed-linux-bundle
         path: target/release/zed-linux-*.tar.gz
         if-no-files-found: error
+
+  release:
+    needs: bundle
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        name: zed-linux-bundle
+        path: bundle
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        version=$(grep -m1 '^version' crates/zed/Cargo.toml | cut -d'"' -f2)
+        tag="v${version}-${GITHUB_SHA::8}"
+        gh release create "$tag" bundle/*.tar.gz \
+          --target "$GITHUB_SHA" \
+          --title "Zed Notebook ${tag}" \
+          --generate-notes \
+          --prerelease
